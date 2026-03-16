@@ -1,11 +1,13 @@
 /**
  * Overview grid – one card per connected agent.
  *
- * Shows live status (window, URL, activity) that updates in real-time from
- * WebSocket events without requiring a page interaction.
+ * Each card seeds itself from the REST API on mount so historical data shows
+ * immediately, then live WebSocket events in `liveStatus` take over.
  */
+import { useEffect, useState } from 'react'
 import { Monitor, Globe, Layout, Clock, Zap, Moon } from 'lucide-react'
 import { cn } from '../lib/utils'
+import { api } from '../lib/api'
 import type { Agent, AgentLiveStatus } from '../lib/types'
 
 // ── Props ─────────────────────────────────────────────────────────────────────
@@ -20,16 +22,51 @@ interface Props {
 
 function AgentCard({
   agent,
-  status,
+  liveStatus,
   onOpen,
 }: {
-  agent:   Agent
-  status?: AgentLiveStatus
-  onOpen:  () => void
+  agent:      Agent
+  liveStatus?: AgentLiveStatus
+  onOpen:     () => void
 }) {
-  const hasData    = status && (status.window || status.url || status.activity)
-  const isAfk      = status?.activity === 'afk'
-  const isActive   = status?.activity === 'active'
+  // Seed from the DB on mount; live events override as they arrive.
+  const [seed, setSeed] = useState<AgentLiveStatus | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      try {
+        const [wins, urls, acts] = await Promise.allSettled([
+          api.windows(agent.id,  { limit: 1 }),
+          api.urls(agent.id,     { limit: 1 }),
+          api.activity(agent.id, { limit: 1 }),
+        ])
+        if (cancelled) return
+        const patch: AgentLiveStatus = {}
+        if (wins.status === 'fulfilled' && wins.value.rows[0]) {
+          patch.window = wins.value.rows[0].title
+          patch.app    = wins.value.rows[0].app
+        }
+        if (urls.status === 'fulfilled' && urls.value.rows[0]) {
+          patch.url = urls.value.rows[0].url
+        }
+        if (acts.status === 'fulfilled' && acts.value.rows[0]) {
+          const row = acts.value.rows[0]
+          patch.activity = row.kind
+          patch.idleSecs = row.idle_secs
+        }
+        setSeed(patch)
+      } catch { /* ignore */ }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [agent.id])
+
+  // Merge: live events win over the seeded data.
+  const status  = liveStatus ?? seed ?? undefined
+  const hasData = status && (status.window || status.url || status.activity)
+  const isAfk   = status?.activity === 'afk'
+  const isActive = status?.activity === 'active'
 
   return (
     <div
@@ -150,7 +187,7 @@ export function OverviewGrid({ agents, liveStatus, onOpen }: Props) {
         <AgentCard
           key={agent.id}
           agent={agent}
-          status={liveStatus[agent.id]}
+          liveStatus={liveStatus[agent.id]}
           onOpen={() => onOpen(agent.id)}
         />
       ))}

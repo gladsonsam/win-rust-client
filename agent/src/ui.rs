@@ -1,25 +1,28 @@
 //! eframe application: system-tray icon + password-gated settings window.
 //!
-//! ## Why we avoid ViewportCommand::Visible(false)
+//! ## Architecture
 //!
-//! Calling Visible(false) causes eframe/winit to suspend the render loop
-//! entirely — update() is never called again, so tray events pile up in
-//! our channel unprocessed.  Instead we keep the window alive at all times
-//! and simply move it off-screen when "hidden":
+//! The window is always alive (eframe needs a window to run its render loop),
+//! but it is hidden via Win32 `ShowWindow(SW_HIDE)` so it is completely
+//! invisible: no taskbar button, not in Alt-Tab, not on screen.
+//! `update()` keeps ticking thanks to `request_repaint_after()`.
 //!
-//!   Hidden  → OuterPosition(-32000, -32000)   window off all monitors
-//!   Visible → OuterPosition(center of screen) window on screen
+//! `WS_EX_TOOLWINDOW` (applied once on the first successful `FindWindowW`) is
+//! a belt-and-suspenders measure to keep the window out of the taskbar even
+//! while it is physically visible.
 //!
-//! WS_EX_TOOLWINDOW (set via the Win32 API once on startup) hides the
-//! window from the taskbar and Alt-Tab switcher so the user never sees it
-//! accidentally.
+//! ## Interaction model
+//!
+//!   Double-click tray icon  →  password prompt  →  settings panel
+//!   "Settings" context menu →  same
+//!   "Exit" context menu     →  password prompt  →  quit (after correct pw)
 
 use std::sync::{mpsc, Arc, Mutex};
 
 use eframe::egui;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 use crate::config::{self, AgentStatus, Config};
@@ -27,15 +30,28 @@ use crate::config::{self, AgentStatus, Config};
 // ─── Screen-position constants ────────────────────────────────────────────────
 
 /// Window position when "hidden": far off every physical monitor.
-const POS_HIDDEN: egui::Pos2 = egui::pos2(-32000.0, -32000.0);
-/// Window position when first shown (reasonable default; user can move it).
+/// We never use SW_HIDE because that suspends eframe's render loop.
+/// WS_EX_TOOLWINDOW keeps this off-screen ghost out of Alt-Tab.
+const POS_HIDDEN:  egui::Pos2 = egui::pos2(-32000.0, -32000.0);
+/// Window position when the user opens the settings/password UI.
 const POS_VISIBLE: egui::Pos2 = egui::pos2(200.0, 120.0);
 
-// ─── Internal tray event type ─────────────────────────────────────────────────
+// ─── Internal event type ──────────────────────────────────────────────────────
 
 enum TrayMsg {
-    Show,        // left-click or "Settings" menu item
-    Quit,        // "Exit" menu item
+    /// Double-click on icon or "Settings" menu item.
+    Show,
+    /// "Exit" menu item – routes through the password prompt.
+    Quit,
+}
+
+// ─── What to do after a successful password unlock ───────────────────────────
+
+#[derive(Debug, Default, PartialEq, Clone)]
+enum PendingAction {
+    #[default]
+    OpenSettings,
+    Quit,
 }
 
 // ─── View state ───────────────────────────────────────────────────────────────
@@ -51,9 +67,13 @@ enum View {
 // ─── Application ─────────────────────────────────────────────────────────────
 
 pub struct AgentApp {
-    view:     View,
-    _tray:    TrayIcon,
-    tray_rx:  mpsc::Receiver<TrayMsg>,
+    view:           View,
+    pending_action: PendingAction,
+    /// Set by `open_window()` so `update()` calls `win32_show_window` this frame.
+    bring_to_front: bool,
+
+    _tray:   TrayIcon,
+    tray_rx: mpsc::Receiver<TrayMsg>,
 
     icon_green:  tray_icon::Icon,
     icon_yellow: tray_icon::Icon,
@@ -72,9 +92,11 @@ pub struct AgentApp {
     p_focus_requested: bool,
 
     form_msg:    Option<(String, bool)>,
-    is_quitting:       bool,
-    /// Set WS_EX_TOOLWINDOW exactly once on the first update() frame.
-    toolwindow_applied: bool,
+    is_quitting: bool,
+
+    /// Win32 HWND stored as isize so the struct is Send-compatible.
+    /// Populated on the first successful `FindWindowW` call in `update()`.
+    hwnd: Option<isize>,
 
     config_tx:    tokio::sync::watch::Sender<Option<Config>>,
     agent_status: Arc<Mutex<AgentStatus>>,
@@ -114,22 +136,17 @@ impl AgentApp {
 
         // ── Event channel ─────────────────────────────────────────────────
         //
-        // set_event_handler is the SOLE consumer of events in tray-icon —
-        // receiver().try_recv() will always be empty once a handler is set.
-        // We forward events into our own channel and call request_repaint()
-        // so update() wakes up even if the window is off-screen.
+        // tray-icon's set_event_handler is the sole consumer of events.
+        // We forward them into an mpsc channel and call request_repaint() so
+        // update() wakes up immediately even when the window is SW_HIDE'd.
         let (tx, tray_rx) = mpsc::channel::<TrayMsg>();
 
         {
             let tx  = tx.clone();
             let ctx = cc.egui_ctx.clone();
             TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-                if let TrayIconEvent::Click {
-                    button:       MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } = e
-                {
+                // Double-click left button → open password prompt
+                if let TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = e {
                     let _ = tx.send(TrayMsg::Show);
                     ctx.request_repaint();
                 }
@@ -154,13 +171,15 @@ impl AgentApp {
         }
 
         Self {
-            view: View::Hidden,
-            _tray: tray,
+            view:           View::Hidden,
+            pending_action: PendingAction::default(),
+            bring_to_front: false,
+            _tray:          tray,
             tray_rx,
             icon_green,
             icon_yellow,
             icon_red,
-            last_status: AgentStatus::Disconnected,
+            last_status:       AgentStatus::Disconnected,
             f_server_url:      initial_config.server_url.clone(),
             f_agent_name:      initial_config.agent_name.clone(),
             f_agent_password:  initial_config.agent_password.clone(),
@@ -170,19 +189,27 @@ impl AgentApp {
             p_input:           String::new(),
             p_error:           false,
             p_focus_requested: false,
-            form_msg:           None,
-            is_quitting:        false,
-            toolwindow_applied: false,
+            form_msg:          None,
+            is_quitting:       false,
+            hwnd:              None,
             config_tx,
             agent_status,
         }
     }
 
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
     fn handle_tray_events(&mut self) {
         while let Ok(msg) = self.tray_rx.try_recv() {
             match msg {
-                TrayMsg::Show => self.open_window(),
-                TrayMsg::Quit => self.is_quitting = true,
+                TrayMsg::Show => {
+                    self.pending_action = PendingAction::OpenSettings;
+                    self.open_window();
+                }
+                TrayMsg::Quit => {
+                    self.pending_action = PendingAction::Quit;
+                    self.open_window();
+                }
             }
         }
     }
@@ -207,6 +234,7 @@ impl AgentApp {
         let _ = self._tray.set_tooltip(Some(tip));
     }
 
+    /// Show the password prompt (or bring window to front if already visible).
     fn open_window(&mut self) {
         if self.view == View::Hidden {
             self.p_input.clear();
@@ -214,6 +242,8 @@ impl AgentApp {
             self.p_focus_requested = false;
             self.view              = View::PasswordPrompt;
         }
+        // Always schedule a bring-to-front so the window grabs focus.
+        self.bring_to_front = true;
     }
 
     fn close_window(&mut self) {
@@ -233,23 +263,23 @@ impl AgentApp {
         } else {
             config::hash_password(&self.f_new_ui_pass)
         };
-        let cfg = Config {
+
+        let new_cfg = Config {
             server_url:       self.f_server_url.trim().to_string(),
             agent_name:       self.f_agent_name.trim().to_string(),
             agent_password:   self.f_agent_password.clone(),
             ui_password_hash: ui_hash,
         };
-        match config::save_config(&cfg) {
-            Ok(()) => {
-                self.saved_config = cfg.clone();
-                let val = if cfg.server_url.is_empty() { None } else { Some(cfg) };
-                let _ = self.config_tx.send(val);
+        match config::save_config(&new_cfg) {
+            Ok(_) => {
+                self.saved_config = new_cfg.clone();
+                let _ = self.config_tx.send(Some(new_cfg));
                 self.f_new_ui_pass.clear();
                 self.f_confirm_ui_pass.clear();
-                self.form_msg = Some(("✓ Settings saved.".into(), false));
+                self.form_msg = Some(("✓  Settings saved".into(), false));
             }
             Err(e) => {
-                self.form_msg = Some((format!("✗ Save failed: {e}"), true));
+                self.form_msg = Some((format!("Save failed: {e}"), true));
             }
         }
     }
@@ -259,41 +289,65 @@ impl AgentApp {
 
 impl eframe::App for AgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply WS_EX_TOOLWINDOW once on the first frame (window now exists).
-        if !self.toolwindow_applied {
-            self.toolwindow_applied = true;
-            #[cfg(target_os = "windows")]
-            apply_toolwindow_by_title();
+        // ── 1. Apply WS_EX_TOOLWINDOW once ───────────────────────────────
+        //
+        // We locate the HWND via FindWindowW (eframe 0.33 does not expose it
+        // publicly).  Retry every frame until FindWindowW succeeds — the window
+        // may not be fully created on the very first update() call.
+        //
+        // WS_EX_TOOLWINDOW hides the window from the taskbar and Alt-Tab, so
+        // the "parked at -32000,-32000" trick is truly invisible to the user.
+        // We never call SW_HIDE because that suspends eframe's render loop.
+        #[cfg(target_os = "windows")]
+        if self.hwnd.is_none() {
+            if let Some(h) = win32_find_and_style_window() {
+                self.hwnd = Some(h);
+            }
         }
 
         let was_hidden = self.view == View::Hidden;
 
-        // Close button → hide (not quit) unless we're doing a real exit
+        // ── 2. Close button → hide (not quit), unless we are really quitting
         if ctx.input(|i| i.viewport().close_requested()) && !self.is_quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_window();
         }
 
-        // Drain tray/menu events (may flip self.view)
+        // ── 3. Drain tray / menu events (may flip self.view / bring_to_front)
         self.handle_tray_events();
         self.sync_tray_status();
 
-        // ── Render ────────────────────────────────────────────────────────
+        // ── 4. Render ─────────────────────────────────────────────────────
         match self.view {
+            // Nothing to show — render a blank panel so egui clears the FB.
             View::Hidden => {
                 egui::CentralPanel::default().show(ctx, |_ui| {});
             }
 
+            // ── Password prompt ───────────────────────────────────────────
             View::PasswordPrompt => {
                 let saved_hash = self.saved_config.ui_password_hash.clone();
                 let mut intent: Option<bool> = None;
 
+                let (heading, subtitle, btn_label) = match self.pending_action {
+                    PendingAction::OpenSettings => (
+                        "🔒  Agent Settings",
+                        "Enter the UI access password:",
+                        "🔓  Unlock",
+                    ),
+                    PendingAction::Quit => (
+                        "🔒  Confirm Exit",
+                        "Enter password to exit the agent:",
+                        "✓  Exit Agent",
+                    ),
+                };
+
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(30.0);
                     ui.vertical_centered(|ui| {
-                        ui.heading("🔒  Agent Settings");
+                        ui.heading(heading);
                         ui.add_space(10.0);
-                        ui.label("Enter the UI access password:");
+                        ui.label(subtitle);
                         ui.add_space(14.0);
 
                         let resp = ui.add(
@@ -318,11 +372,21 @@ impl eframe::App for AgentApp {
                         ui.add_space(14.0);
                         let enter   = ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let clicked = ui
-                            .add_sized([120.0, 32.0], egui::Button::new("🔓  Unlock"))
+                            .add_sized([140.0, 32.0], egui::Button::new(btn_label))
                             .clicked();
 
                         if (enter || clicked) && intent.is_none() {
-                            intent = Some(config::hash_password(&self.p_input) == saved_hash);
+                            intent = Some(
+                                config::hash_password(&self.p_input) == saved_hash,
+                            );
+                        }
+
+                        ui.add_space(8.0);
+                        if ui
+                            .add_sized([140.0, 28.0], egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            self.close_window();
                         }
                     });
                 });
@@ -331,13 +395,20 @@ impl eframe::App for AgentApp {
                     Some(true) => {
                         self.p_input.clear();
                         self.p_error = false;
-                        self.f_server_url     = self.saved_config.server_url.clone();
-                        self.f_agent_name     = self.saved_config.agent_name.clone();
-                        self.f_agent_password = self.saved_config.agent_password.clone();
-                        self.f_new_ui_pass.clear();
-                        self.f_confirm_ui_pass.clear();
-                        self.form_msg = None;
-                        self.view = View::Settings;
+                        match self.pending_action {
+                            PendingAction::OpenSettings => {
+                                self.f_server_url     = self.saved_config.server_url.clone();
+                                self.f_agent_name     = self.saved_config.agent_name.clone();
+                                self.f_agent_password = self.saved_config.agent_password.clone();
+                                self.f_new_ui_pass.clear();
+                                self.f_confirm_ui_pass.clear();
+                                self.form_msg = None;
+                                self.view = View::Settings;
+                            }
+                            PendingAction::Quit => {
+                                self.is_quitting = true;
+                            }
+                        }
                     }
                     Some(false) => {
                         self.p_error = true;
@@ -347,6 +418,7 @@ impl eframe::App for AgentApp {
                 }
             }
 
+            // ── Settings panel ────────────────────────────────────────────
             View::Settings => {
                 let status = self.agent_status.lock().unwrap().clone();
                 let mut action: Option<SettingsAction> = None;
@@ -377,7 +449,8 @@ impl eframe::App for AgentApp {
 
                                     ui.label("Agent Password:");
                                     ui.add(egui::TextEdit::singleline(&mut self.f_agent_password)
-                                        .password(true).hint_text("(optional)")
+                                        .password(true)
+                                        .hint_text("(blank = none)")
                                         .desired_width(290.0));
                                     ui.end_row();
                                 });
@@ -387,55 +460,65 @@ impl eframe::App for AgentApp {
 
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.label(egui::RichText::new("UI Access Password").strong());
-                            ui.label(egui::RichText::new("Leave blank to keep current.")
-                                .small().color(egui::Color32::GRAY));
                             ui.add_space(4.0);
-                            egui::Grid::new("sec").num_columns(2).spacing([8.0, 8.0])
+                            egui::Grid::new("uipw").num_columns(2).spacing([8.0, 8.0])
                                 .show(ui, |ui| {
                                     ui.label("New Password:");
                                     ui.add(egui::TextEdit::singleline(&mut self.f_new_ui_pass)
                                         .password(true)
-                                        .hint_text("leave blank = no change")
-                                        .desired_width(250.0));
+                                        .hint_text("leave blank to keep current")
+                                        .desired_width(240.0));
                                     ui.end_row();
 
                                     ui.label("Confirm:");
                                     ui.add(egui::TextEdit::singleline(&mut self.f_confirm_ui_pass)
-                                        .password(true).desired_width(250.0));
+                                        .password(true)
+                                        .desired_width(240.0));
                                     ui.end_row();
                                 });
                         });
 
                         ui.add_space(8.0);
 
-                        ui.horizontal(|ui| {
-                            ui.label("Status:");
-                            let (color, label) = match &status {
-                                AgentStatus::Connected    => (egui::Color32::from_rgb(46,204,113), "● Connected"),
-                                AgentStatus::Connecting   => (egui::Color32::from_rgb(241,196,15), "◌ Connecting…"),
-                                AgentStatus::Disconnected => (egui::Color32::from_rgb(149,165,166), "○ Disconnected"),
-                                AgentStatus::Error(_)     => (egui::Color32::from_rgb(231,76,60),  "✗ Error"),
+                        // Status badge
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            let (dot, label) = match &status {
+                                AgentStatus::Connected    =>
+                                    ("🟢", "Connected".to_string()),
+                                AgentStatus::Connecting   =>
+                                    ("🟡", "Connecting…".to_string()),
+                                AgentStatus::Disconnected =>
+                                    ("🔴", "Disconnected".to_string()),
+                                AgentStatus::Error(e)     =>
+                                    ("🔴", format!("Error: {e}")),
                             };
-                            ui.colored_label(color, label);
+                            ui.horizontal(|ui| {
+                                ui.label(dot);
+                                ui.label(egui::RichText::new(label).monospace());
+                            });
                         });
 
+                        ui.add_space(12.0);
+
                         if let Some((msg, is_err)) = &self.form_msg {
-                            ui.add_space(4.0);
-                            let c = if *is_err { egui::Color32::from_rgb(231,76,60) }
-                                    else        { egui::Color32::from_rgb(46,204,113) };
-                            ui.colored_label(c, msg);
+                            let color = if *is_err {
+                                egui::Color32::from_rgb(231, 76, 60)
+                            } else {
+                                egui::Color32::from_rgb(46, 204, 113)
+                            };
+                            ui.colored_label(color, msg);
+                            ui.add_space(6.0);
                         }
 
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
                         ui.horizontal(|ui| {
-                            if ui.add_sized([100.0, 30.0], egui::Button::new("💾  Save")).clicked() {
+                            if ui.add_sized([120.0, 32.0],
+                                egui::Button::new("💾  Save")).clicked()
+                            {
                                 action = Some(SettingsAction::Save);
                             }
-                            ui.add_space(8.0);
-                            if ui.add_sized([100.0, 30.0], egui::Button::new("✕  Close")).clicked() {
+                            if ui.add_sized([100.0, 32.0],
+                                egui::Button::new("✖  Close")).clicked()
+                            {
                                 action = Some(SettingsAction::Close);
                             }
                         });
@@ -450,27 +533,37 @@ impl eframe::App for AgentApp {
             }
         }
 
-        // ── Move window on/off screen AFTER processing events ─────────────
+        // ── 5. Position window (park off-screen or move on-screen) ───────────
         //
-        // We never call Visible(false) — that suspends update().
-        // Instead we keep the window running but positioned off all monitors.
+        // We NEVER call SW_HIDE — that suspends eframe's render loop and makes
+        // tray events unprocessable.  Instead we park the window far off every
+        // monitor while it is "hidden", and move it back when shown.
+        // WS_EX_TOOLWINDOW (applied above) keeps the off-screen window out of
+        // Alt-Tab so the user never stumbles across it accidentally.
+
         let now_hidden = self.view == View::Hidden;
 
         if now_hidden {
-            // Keep it parked off-screen so it never flashes into view
+            // Keep the window parked off-screen every frame.
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(POS_HIDDEN));
-        } else if was_hidden && !now_hidden {
-            // Transition: hidden → visible — move onto screen and focus
+        } else if self.bring_to_front {
+            // Move on-screen and steal focus.
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(POS_VISIBLE));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            #[cfg(target_os = "windows")]
+            if let Some(h) = self.hwnd {
+                win32_focus_window(h);
+            }
+            self.bring_to_front = false;
         }
 
         if self.is_quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // Keep ticking even off-screen so status updates propagate to tray
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Tick at 10 Hz when hidden (enough for tray events), 60 Hz when visible.
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            if now_hidden { 100 } else { 16 },
+        ));
     }
 }
 
@@ -479,34 +572,60 @@ impl eframe::App for AgentApp {
 #[derive(Debug)]
 enum SettingsAction { Save, Close }
 
-/// Hide our window from the taskbar and Alt-Tab by applying WS_EX_TOOLWINDOW.
+// ── Win32 window management ──────────────────────────────────────────────────
+
+/// Find the application window by its title, apply `WS_EX_TOOLWINDOW` (hide
+/// from taskbar / Alt-Tab), and return the HWND as an `isize`.
 ///
-/// We locate our HWND via FindWindowW (by title) because eframe 0.33 does not
-/// expose raw_window_handle publicly.  Called once from the first update() so
-/// the Win32 window definitely exists by then.
+/// Returns `None` if the window cannot be found yet (retry next frame).
 #[cfg(target_os = "windows")]
-fn apply_toolwindow_by_title() {
+fn win32_find_and_style_window() -> Option<isize> {
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, GetWindowLongW, SetWindowLongW,
         GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
-    // Null-terminated UTF-16 title
+    // Null-terminated UTF-16 window title
     let title: Vec<u16> = "Agent Settings\0".encode_utf16().collect();
     unsafe {
-        // In windows 0.58, FindWindowW returns Result<HWND>
-        if let Ok(hwnd) = FindWindowW(
+        let result = FindWindowW(
             windows::core::PCWSTR::null(),
             windows::core::PCWSTR(title.as_ptr()),
-        ) {
-            let ex  = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-            let new = (ex | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
-            SetWindowLongW(hwnd, GWL_EXSTYLE, new as i32);
+        );
+        match result {
+            Ok(hwnd) if !hwnd.is_invalid() => {
+                // Remove WS_EX_APPWINDOW (taskbar button), add WS_EX_TOOLWINDOW
+                // (tool-style window: no taskbar entry, hidden from Alt-Tab).
+                let ex  = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                let new = (ex | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
+                SetWindowLongW(hwnd, GWL_EXSTYLE, new as i32);
+                Some(hwnd.0 as usize as isize)
+            }
+            _ => None,
         }
     }
 }
 
+/// Bring the window to the foreground and give it keyboard focus.
+///
+/// Called after `ViewportCommand::OuterPosition(POS_VISIBLE)` has already
+/// moved the window on-screen.  The double call (SetForegroundWindow +
+/// BringWindowToTop) is the standard Windows trick to reliably steal focus
+/// when triggered by a user action such as a tray icon click.
+#[cfg(target_os = "windows")]
+fn win32_focus_window(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
+    unsafe {
+        let h = HWND(hwnd as usize as *mut _);
+        let _ = SetForegroundWindow(h);
+        let _ = BringWindowToTop(h);
+    }
+}
+
+// ── Tray icon generator ───────────────────────────────────────────────────────
+
 /// Generate a 32×32 RGBA filled circle for use as a tray icon.
-fn make_circle_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
+pub fn make_circle_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
     const S: u32 = 32;
     let mut px = vec![0u8; (S * S * 4) as usize];
     let c = S as f32 / 2.0 - 0.5;
