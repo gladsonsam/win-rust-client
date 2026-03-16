@@ -1,0 +1,99 @@
+# Build with:  cargo xwin build --release
+# (run from the agent/ directory, or from the repo root with -p agent)
+#
+# The agent is intentionally NOT a member of the workspace because it is a
+# Windows-only binary.  Including it in a workspace causes Linux tooling
+# (rust-analyzer, cargo check, Docker builds) to try to compile
+# Windows-only crates such as windows-capture on Linux, where
+# #[cfg(windows)] is false and the build always fails.
+
+[package]
+name        = "agent"
+version     = "0.1.0"
+edition     = "2021"
+description = "Windows monitoring agent – screen capture, keylogging, URL tracking, and remote input injection over WebSocket"
+
+# Windows-only binary.  Cross-compile from Linux with:
+#   cargo xwin build --release --package agent
+[[bin]]
+name = "win-rust-client"
+path = "src/main.rs"
+
+[dependencies]
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
+tokio        = { version = "1",    features = ["full"] }
+futures-util = "0.3"
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite       = { version = "0.24", default-features = false }
+
+# ── Screen capture ────────────────────────────────────────────────────────────
+# xcap is a cross-platform capture library; on Windows it uses the Graphics
+# Capture API internally but returns a clean RgbaImage — no buffer-padding
+# or dimension mismatch issues.
+xcap = "0.9"
+
+# ── JPEG encoding ─────────────────────────────────────────────────────────────
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# ── Browser URL scraping ──────────────────────────────────────────────────────
+browser-url = "0.1"
+
+# ── Input injection ───────────────────────────────────────────────────────────
+enigo = "0.2"
+
+# ── Windows API ───────────────────────────────────────────────────────────────
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",            # OpenProcess, QueryFullProcessImageNameW
+    "Win32_UI_Input_KeyboardAndMouse",   # VK_* constants, GetAsyncKeyState, ToUnicodeEx, GetLastInputInfo
+] }
+
+# ── Serialisation ─────────────────────────────────────────────────────────────
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Error handling ────────────────────────────────────────────────────────────
+anyhow    = "1"
+thiserror = "1"
+
+# ── System tray ───────────────────────────────────────────────────────────────
+tray-icon = "0.21"
+
+# ── GUI (egui / eframe) ───────────────────────────────────────────────────────
+eframe = { version = "0.33", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+
+# ── Password hashing ──────────────────────────────────────────────────────────
+sha2 = "0.10"
+
+# ── Platform directories (AppData) ───────────────────────────────────────────
+dirs = "6"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Release profile – small, fast, single-file binary
+# ─────────────────────────────────────────────────────────────────────────────
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local patches
+# ─────────────────────────────────────────────────────────────────────────────
+# browser-url 0.1.1 ships with two hardcoded debug println!s in its Windows
+# backend.  This is a verbatim copy with those two lines removed.
+[patch.crates-io]
+browser-url = { path = "patches/browser-url" }

@@ -1,15 +1,24 @@
-# Rust build output
-/target
+# ── Build output ─────────────────────────────────────────────────────────────
+/target/
+/agent/target/
 
-# cargo-xwin: downloaded Windows SDK / MSVC CRT (re-fetched automatically)
-/.xwin-cache
+# ── Cross-compilation cache (cargo-xwin) ─────────────────────────────────────
+/.xwin-cache/
 
-# Vendored crate build artifacts and cargo registry metadata
-/patches/*/target
-/patches/*/.cargo-ok
-/patches/*/.cargo_vcs_info.json
-/patches/*/Cargo.toml.orig
-/patches/*/Cargo.lock
+# ── Vendored crate build artifacts (browser-url patch) ───────────────────────
+/agent/patches/*/target/
+/agent/patches/*/.cargo-ok
+/agent/patches/*/.cargo_vcs_info.json
+/agent/patches/*/Cargo.toml.orig
+/agent/patches/*/Cargo.lock
 
-# Local helper scripts (machine-specific paths)
+# ── Local scripts ────────────────────────────────────────────────────────────
 move.sh
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,14 @@
+# agent/ is a standalone crate (not a workspace member) – not needed for server builds
+agent/
+
+# Rust build artefacts
+target/
+.xwin-cache/
+
+# Node deps (copied from package.json during Docker build instead)
+frontend/node_modules/
+
+# Git / dev files
+.git/
+*.md
+move.sh

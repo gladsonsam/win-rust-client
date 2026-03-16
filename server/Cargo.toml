@@ -1,0 +1,47 @@
+[package]
+name    = "server"
+version = "0.1.0"
+edition = "2021"
+description = "Monitoring server – WebSocket ingestion, PostgreSQL storage, and web dashboard"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
+tokio        = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# ── HTTP + WebSocket server ───────────────────────────────────────────────────
+axum       = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlx = { version = "0.7", features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "migrate",
+] }
+
+# ── Types ─────────────────────────────────────────────────────────────────────
+uuid   = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ── Serialisation ─────────────────────────────────────────────────────────────
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Streaming / bytes ─────────────────────────────────────────────────────────
+bytes        = "1"
+async-stream = "0.3"
+
+# ── Error handling ────────────────────────────────────────────────────────────
+anyhow = "1"

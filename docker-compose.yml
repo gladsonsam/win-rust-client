@@ -1,0 +1,36 @@
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       monitor
+      POSTGRES_USER:     monitor
+      POSTGRES_PASSWORD: changeme
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitor"]
+      interval: 5s
+      timeout:  5s
+      retries:  10
+
+  # ── Monitoring server ────────────────────────────────────────────────────────
+  server:
+    build:
+      context:    .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "9000:9000"     # Dashboard + agent WebSocket
+    environment:
+      DATABASE_URL: postgres://monitor:changeme@db:5432/monitor
+      LISTEN_ADDR:  0.0.0.0:9000
+      RUST_LOG:     info
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
