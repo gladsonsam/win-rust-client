@@ -1,7 +1,7 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import {
   Monitor, Keyboard, Globe, Layout, Activity,
-  Wifi, WifiOff, Loader2, Menu, ArrowLeft,
+  Wifi, WifiOff, Loader2, Menu, ArrowLeft, LogOut,
 } from 'lucide-react'
 
 import { useWebSocket, type WsStatus } from './hooks/useWebSocket'
@@ -12,7 +12,9 @@ import { KeysTab }      from './components/KeysTab'
 import { WindowsTab }   from './components/WindowsTab'
 import { UrlsTab }      from './components/UrlsTab'
 import { ActivityTab }  from './components/ActivityTab'
+import { LoginPage }    from './components/LoginPage'
 import { cn }           from './lib/utils'
+import { api }          from './lib/api'
 import type { Agent, AgentLiveStatus, TabKey, WsEvent } from './lib/types'
 
 // ── Tab definitions ───────────────────────────────────────────────────────────
@@ -25,9 +27,11 @@ const TABS: { key: TabKey; label: string; Icon: typeof Monitor }[] = [
   { key: 'activity', label: 'Activity', Icon: Activity  },
 ]
 
-// ── App ───────────────────────────────────────────────────────────────────────
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+// Rendered only when authenticated. Contains the WebSocket connection so it is
+// never opened before the user has logged in.
 
-export default function App() {
+function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [agents,      setAgents]      = useState<Record<string, Agent>>({})
   const [liveStatus,  setLiveStatus]  = useState<Record<string, AgentLiveStatus>>({})
   const [selectedId,  setSelectedId]  = useState<string | null>(null)
@@ -36,11 +40,10 @@ export default function App() {
   const [wsStatus,    setWsStatus]    = useState<WsStatus>('connecting')
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
-  // Debounced refresh for data tabs.
   const [refreshKey,  setRefreshKey]  = useState(0)
   const refreshTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const sendRef    = useRef<((d: unknown) => void) | null>(null)
+  const sendRef     = useRef<((d: unknown) => void) | null>(null)
   const selectedRef = useRef<string | null>(null)
   selectedRef.current = selectedId
 
@@ -60,7 +63,7 @@ export default function App() {
 
   const scheduleRefresh = useCallback((agentId: string) => {
     if (agentId !== selectedRef.current) return
-    if (refreshTimer.current) return          // already scheduled
+    if (refreshTimer.current) return
     refreshTimer.current = setTimeout(() => {
       setRefreshKey(k => k + 1)
       refreshTimer.current = null
@@ -89,7 +92,6 @@ export default function App() {
 
       case 'agent_disconnected':
         setAgents(prev => { const n = { ...prev }; delete n[ev.agent_id]; return n })
-        // If viewing this agent, fall back to overview.
         if (selectedRef.current === ev.agent_id) {
           setView('overview')
           setSelectedId(null)
@@ -148,6 +150,13 @@ export default function App() {
     setSidebarOpen(false)
   }, [])
 
+  // ── Logout ─────────────────────────────────────────────────────────────────
+
+  const handleLogout = useCallback(async () => {
+    await api.logout().catch(() => {})
+    onLogout()
+  }, [onLogout])
+
   const selectedAgent = selectedId ? agents[selectedId] : null
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -189,17 +198,34 @@ export default function App() {
           <span className="text-[15px] font-semibold tracking-wide">🖥 Monitor</span>
         )}
 
-        {/* WS status pill */}
-        <div className="ml-auto flex items-center gap-1.5 text-xs text-muted flex-shrink-0">
-          {wsStatus === 'connected'    && (
-            <><Wifi    size={12} className="text-ok"     /><span className="hidden sm:inline">Connected</span></>
-          )}
-          {wsStatus === 'disconnected' && (
-            <><WifiOff size={12} className="text-danger" /><span className="hidden sm:inline">Disconnected</span></>
-          )}
-          {wsStatus === 'connecting'   && (
-            <><Loader2 size={12} className="animate-spin" /><span className="hidden sm:inline">Connecting…</span></>
-          )}
+        {/* Right side: WS status + logout */}
+        <div className="ml-auto flex items-center gap-3 flex-shrink-0">
+
+          {/* WS status pill */}
+          <div className="flex items-center gap-1.5 text-xs text-muted">
+            {wsStatus === 'connected'    && (
+              <><Wifi    size={12} className="text-ok"     /><span className="hidden sm:inline">Connected</span></>
+            )}
+            {wsStatus === 'disconnected' && (
+              <><WifiOff size={12} className="text-danger" /><span className="hidden sm:inline">Disconnected</span></>
+            )}
+            {wsStatus === 'connecting'   && (
+              <><Loader2 size={12} className="animate-spin" /><span className="hidden sm:inline">Connecting…</span></>
+            )}
+          </div>
+
+          {/* Logout button */}
+          <button
+            onClick={handleLogout}
+            title="Sign out"
+            className="flex items-center gap-1.5 px-2 py-1 rounded text-xs
+                       text-muted hover:text-primary hover:bg-border/40
+                       transition-colors"
+          >
+            <LogOut size={12} />
+            <span className="hidden sm:inline">Sign out</span>
+          </button>
+
         </div>
       </header>
 
@@ -291,4 +317,35 @@ export default function App() {
       </div>
     </div>
   )
+}
+
+// ── Auth wrapper ──────────────────────────────────────────────────────────────
+// Checks /api/auth/status on mount, then renders either the login page or
+// the dashboard.  The Dashboard component (and its WebSocket connection) are
+// only instantiated after a confirmed valid session.
+
+type AuthState = 'loading' | 'login' | 'ok'
+
+export default function App() {
+  const [authState, setAuthState] = useState<AuthState>('loading')
+
+  useEffect(() => {
+    api.authStatus()
+      .then(d => setAuthState(d.authenticated ? 'ok' : 'login'))
+      .catch(() => setAuthState('login'))
+  }, [])
+
+  if (authState === 'loading') {
+    return (
+      <div className="min-h-screen bg-bg flex items-center justify-center">
+        <Loader2 size={28} className="animate-spin text-muted" />
+      </div>
+    )
+  }
+
+  if (authState === 'login') {
+    return <LoginPage onSuccess={() => setAuthState('ok')} />
+  }
+
+  return <Dashboard onLogout={() => setAuthState('login')} />
 }

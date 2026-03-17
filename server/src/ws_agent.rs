@@ -7,6 +7,11 @@
 //! Each agent connection also gets a per-agent command channel so that
 //! dashboard viewers can send mouse/keyboard control commands back to the
 //! agent (via the server) without needing a direct connection.
+//!
+//! Screen capture is demand-driven: the MJPEG stream handler in `api.rs`
+//! sends `start_capture` / `stop_capture` based on viewer count.  The agent
+//! always stops capture when its WebSocket session ends, so each new session
+//! starts idle until explicitly asked to capture.
 
 use std::sync::Arc;
 
@@ -68,18 +73,6 @@ async fn run(mut ws: WebSocket, name: String, state: Arc<AppState>) {
     // commands (MouseMove / MouseClick) through the server to this agent.
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
     state.agent_cmds.lock().unwrap().insert(agent_id, cmd_tx.clone());
-
-    // If MJPEG viewers were already watching before this (re)connect, tell
-    // the agent to start capture immediately so the stream resumes without
-    // the viewer needing to disconnect and reconnect.
-    let watching = state.capture_viewers.lock().unwrap()
-        .get(&agent_id)
-        .copied()
-        .unwrap_or(0);
-    if watching > 0 {
-        let _ = cmd_tx.send(r#"{"type":"start_capture"}"#.to_string());
-        info!("Agent {name}: resuming capture ({watching} viewer(s) waiting).");
-    }
 
     // Notify dashboard viewers.
     state.broadcast(

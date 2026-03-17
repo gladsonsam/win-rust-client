@@ -28,6 +28,7 @@ services:
       DATABASE_URL: postgres://monitor:changeme@db:5432/monitor
       LISTEN_ADDR:  0.0.0.0:9000
       RUST_LOG:     info
+      UI_PASSWORD:  changeme   # Set to a strong password; remove to disable auth
     depends_on:
       db:
         condition: service_healthy

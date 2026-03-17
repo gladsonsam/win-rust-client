@@ -132,8 +132,11 @@ async fn agent_screen(
 ///
 /// ## Demand-driven capture lifecycle
 ///
-/// - On the **first** viewer connecting: `{"type":"start_capture"}` is sent to
-///   the agent, which spawns its OS capture thread.
+/// - On the **first** viewer connecting (while agent is online): `{"type":"start_capture"}`
+///   is sent to the agent, which spawns its OS capture thread.
+/// - If the agent **reconnects** while a viewer is already watching, the stream
+///   loop detects the online→offline→online transition and re-sends
+///   `{"type":"start_capture"}` (the agent always stops capture on session end).
 /// - On the **last** viewer disconnecting (HTTP connection closes): a RAII
 ///   [`CaptureGuard`] sends `{"type":"stop_capture"}` so the agent idles at ~0 %
 ///   CPU until someone watches again.
@@ -174,9 +177,25 @@ async fn agent_mjpeg(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut last_len: usize = 0;
+        // Track whether the agent was reachable on the previous tick so we can
+        // re-issue start_capture the moment it comes back online (the agent
+        // always stops capture when its WebSocket session ends, so it needs a
+        // fresh start_capture even if the MJPEG HTTP connection never dropped).
+        let mut agent_was_online = false;
 
         loop {
             interval.tick().await;
+
+            let agent_online = stream_state.agents.lock().unwrap().contains_key(&id);
+
+            // Agent just (re)connected while we're still watching — send a
+            // fresh start_capture so frames start flowing again.
+            if agent_online && !agent_was_online {
+                if let Some(tx) = stream_state.agent_cmds.lock().unwrap().get(&id) {
+                    let _ = tx.send(r#"{"type":"start_capture"}"#.to_string());
+                }
+            }
+            agent_was_online = agent_online;
 
             let frame = stream_state.frames.lock().unwrap().get(&id).cloned();
 

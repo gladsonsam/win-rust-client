@@ -44,12 +44,16 @@ browser-url = "0.1"
 # ── Input injection ───────────────────────────────────────────────────────────
 enigo = "0.2"
 
-# ── Windows API ───────────────────────────────────────────────────────────────
+# ── Cross-platform GUI ────────────────────────────────────────────────────────
+eframe        = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu"] }
+global-hotkey = "0.6"
+
+# ── Windows API (keylogger + window tracker only; UI is now egui) ─────────────
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Threading",            # OpenProcess, QueryFullProcessImageNameW
-    "Win32_UI_Input_KeyboardAndMouse",   # VK_* constants, GetAsyncKeyState, ToUnicodeEx, GetLastInputInfo
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # ── Serialisation ─────────────────────────────────────────────────────────────
@@ -63,15 +67,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ── Error handling ────────────────────────────────────────────────────────────
 anyhow    = "1"
 thiserror = "1"
-
-# ── System tray ───────────────────────────────────────────────────────────────
-tray-icon = "0.21"
-
-# ── GUI (egui / eframe) ───────────────────────────────────────────────────────
-eframe = { version = "0.33", default-features = false, features = [
-    "glow",
-    "default_fonts",
-] }
 
 # ── Password hashing ──────────────────────────────────────────────────────────
 sha2 = "0.10"

@@ -2,14 +2,20 @@
 //!
 //! ## Environment variables
 //!
-//! | Variable       | Default                                        |
-//! |----------------|------------------------------------------------|
+//! | Variable       | Default                                             |
+//! |----------------|-----------------------------------------------------|
 //! | `DATABASE_URL` | `postgres://monitor:monitor@localhost:5432/monitor` |
-//! | `LISTEN_ADDR`  | `0.0.0.0:9000`                                |
-//! | `STATIC_DIR`   | `./static`                                     |
-//! | `RUST_LOG`     | `info`                                         |
+//! | `LISTEN_ADDR`  | `0.0.0.0:9000`                                      |
+//! | `STATIC_DIR`   | `./static`                                          |
+//! | `UI_PASSWORD`  | *(unset – open access)*                             |
+//! | `RUST_LOG`     | `info`                                              |
+//!
+//! Set `UI_PASSWORD` to enable password protection for the dashboard.
+//! The agent WebSocket (`/ws/agent`) is always unauthenticated so agents
+//! can connect without browser cookies.
 
 mod api;
+mod auth;
 mod db;
 mod state;
 mod ws_agent;
@@ -17,7 +23,11 @@ mod ws_viewer;
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{
+    middleware::from_fn_with_state,
+    routing::{get, post},
+    Router,
+};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -43,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Database connection failed: {e}"))?;
 
-    // Run embedded migrations (baked in at compile time from ./migrations/).
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -51,20 +60,41 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Database ready.");
 
+    // ── UI password ───────────────────────────────────────────────────────
+    let ui_password = std::env::var("UI_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    if ui_password.is_some() {
+        info!("Dashboard password protection enabled.");
+    } else {
+        info!("Dashboard password protection disabled (set UI_PASSWORD to enable).");
+    }
+
     // ── App state ─────────────────────────────────────────────────────────
-    let state = Arc::new(state::AppState::new(pool));
+    let state = Arc::new(state::AppState::new(pool, ui_password));
 
     // ── Routes ────────────────────────────────────────────────────────────
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./static".into());
 
-    let app = Router::new()
-        // Agent WebSocket  – agents connect here
-        .route("/ws/agent", get(ws_agent::handler))
-        // Viewer WebSocket – dashboard connects here for live events
+    // Auth endpoints — always open (needed to obtain / clear the session cookie).
+    let auth_routes = Router::new()
+        .route("/api/login",       post(auth::login))
+        .route("/api/logout",      post(auth::logout))
+        .route("/api/auth/status", get(auth::status));
+
+    // Everything else requires a valid session when UI_PASSWORD is set.
+    let protected = Router::new()
         .route("/ws/view", get(ws_viewer::handler))
-        // REST API
         .nest("/api", api::router())
-        // Static dashboard (index.html + assets)
+        .route_layer(from_fn_with_state(state.clone(), auth::require_auth));
+
+    let app = Router::new()
+        // Agent WebSocket — never gated by UI auth (agents use their own secret).
+        .route("/ws/agent", get(ws_agent::handler))
+        .merge(auth_routes)
+        .merge(protected)
+        // Static dashboard (index.html + assets) — served last as fallback.
         .fallback_service(
             ServeDir::new(&static_dir).append_index_html_on_directories(true),
         )

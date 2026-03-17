@@ -1,6 +1,6 @@
 //! Shared application state, threaded through Axum via `Arc<AppState>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -57,10 +57,18 @@ pub struct AppState {
     /// - Count  0 → 1: send `{"type":"start_capture"}` to agent.
     /// - Count  1 → 0: send `{"type":"stop_capture"}` to agent.
     pub capture_viewers: Mutex<HashMap<Uuid, u32>>,
+
+    /// Plain-text UI password loaded from `UI_PASSWORD` env var.
+    /// `None` means the dashboard is open with no authentication.
+    pub ui_password: Option<String>,
+
+    /// Active dashboard session tokens (random UUIDs issued on login).
+    /// Stored in memory only — reset when the server restarts.
+    pub sessions: Mutex<HashSet<String>>,
 }
 
 impl AppState {
-    pub fn new(db: PgPool) -> Self {
+    pub fn new(db: PgPool, ui_password: Option<String>) -> Self {
         let (tx, _) = broadcast::channel(4096);
         Self {
             db,
@@ -69,6 +77,8 @@ impl AppState {
             frames:          Mutex::new(HashMap::new()),
             agent_cmds:      Mutex::new(HashMap::new()),
             capture_viewers: Mutex::new(HashMap::new()),
+            ui_password,
+            sessions:        Mutex::new(HashSet::new()),
         }
     }
 
