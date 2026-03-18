@@ -29,10 +29,7 @@ use xcap::Monitor;
 /// Setting `stop` to `true` causes the thread to exit after the current frame.
 ///
 /// When `tx` is closed (channel dropped) the thread also exits automatically.
-pub fn start_capture(
-    tx:   mpsc::Sender<Vec<u8>>,
-    stop: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+pub fn start_capture(tx: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("screen-capture".into())
         .spawn(move || {

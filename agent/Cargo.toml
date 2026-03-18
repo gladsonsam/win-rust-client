@@ -8,15 +8,15 @@
 # #[cfg(windows)] is false and the build always fails.
 
 [package]
-name        = "agent"
+name        = "sentinel-agent"
 version     = "0.1.0"
 edition     = "2021"
-description = "Windows monitoring agent – screen capture, keylogging, URL tracking, and remote input injection over WebSocket"
+description = "Sentinel – Windows monitoring agent: screen capture, keylogging, URL tracking, and remote control over WebSocket"
 
 # Windows-only binary.  Cross-compile from Linux with:
-#   cargo xwin build --release --package agent
+#   cargo xwin build --release --package sentinel-agent
 [[bin]]
-name = "win-rust-client"
+name = "sentinel-agent"
 path = "src/main.rs"
 
 [dependencies]
@@ -28,6 +28,7 @@ futures-util = "0.3"
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 tungstenite       = { version = "0.24", default-features = false }
+native-tls        = "0.2"
 
 # ── Screen capture ────────────────────────────────────────────────────────────
 # xcap is a cross-platform capture library; on Windows it uses the Graphics
@@ -63,6 +64,7 @@ serde_json = "1"
 # ── Logging ───────────────────────────────────────────────────────────────────
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender   = "0.2"
 
 # ── Error handling ────────────────────────────────────────────────────────────
 anyhow    = "1"

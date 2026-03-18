@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Monitor Dashboard</title>
+  <title>Sentinel</title>
   <style>
     /* ── Reset & theme ───────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -95,7 +95,7 @@
 
 <!-- ── Top bar ──────────────────────────────────────────────────────────── -->
 <header>
-  <h1>🖥 Monitor</h1>
+  <h1>🛡 Sentinel</h1>
   <div id="wsStatus"><div class="dot" id="statusDot"></div><span id="statusTxt">Connecting…</span></div>
 </header>
 
@@ -140,7 +140,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 const S = {
   ws:            null,
-  agents:        {},        // id → { id, name, connected_at }
+  agents:        {},        // id → { id, name, online, connected_at, last_connected_at, last_disconnected_at, last_seen }
   activeAgent:   null,      // uuid string
   activeTab:     'screen',
   remoteEnabled: false,
@@ -188,12 +188,23 @@ function handleEvent(ev) {
       break;
 
     case 'agent_connected':
-      S.agents[ev.agent_id] = { id: ev.agent_id, name: ev.name, connected_at: new Date().toISOString() };
+      S.agents[ev.agent_id] = {
+        ...(S.agents[ev.agent_id] || { id: ev.agent_id, name: ev.name }),
+        id: ev.agent_id,
+        name: ev.name,
+        online: true,
+        connected_at: ev.connected_at || new Date().toISOString(),
+        last_connected_at: ev.connected_at || new Date().toISOString(),
+      };
       renderSidebar();
       break;
 
     case 'agent_disconnected':
-      delete S.agents[ev.agent_id];
+      if (S.agents[ev.agent_id]) {
+        S.agents[ev.agent_id].online = false;
+        S.agents[ev.agent_id].connected_at = null;
+        S.agents[ev.agent_id].last_disconnected_at = ev.disconnected_at || new Date().toISOString();
+      }
       renderSidebar();
       if (S.activeAgent === ev.agent_id) stopMjpeg();
       break;
@@ -222,16 +233,26 @@ function handleEvent(ev) {
 function renderSidebar() {
   const list = byId('agentList');
   list.innerHTML = '';
-  Object.values(S.agents).forEach(a => {
+  const agents = Object.values(S.agents).sort((a,b) => {
+    const ta = a.online ? (a.connected_at || a.last_seen || a.last_connected_at || '') : (a.last_seen || a.last_disconnected_at || a.last_connected_at || '');
+    const tb = b.online ? (b.connected_at || b.last_seen || b.last_connected_at || '') : (b.last_seen || b.last_disconnected_at || b.last_connected_at || '');
+    return String(tb).localeCompare(String(ta));
+  });
+
+  agents.forEach(a => {
     const el = document.createElement('div');
     el.className = 'agent-item' + (a.id === S.activeAgent ? ' active' : '');
-    el.innerHTML = `<span class="a-name"><span class="a-dot"></span>${esc(a.name)}</span>
-                    <span class="a-meta">${ts(a.connected_at)}</span>`;
+    const dot = `<span class="a-dot" style="background:${a.online ? 'var(--ok)' : 'var(--danger)'}"></span>`;
+    const meta = a.online
+      ? `Online • since ${ts(a.connected_at)}`
+      : `Offline • last ${ts(a.last_disconnected_at || a.last_seen || a.last_connected_at)}`;
+    el.innerHTML = `<span class="a-name">${dot}${esc(a.name)}</span>
+                    <span class="a-meta">${meta}</span>`;
     el.onclick = () => selectAgent(a.id);
     list.appendChild(el);
   });
   if (!Object.keys(S.agents).length) {
-    list.innerHTML = '<div style="padding:16px;color:var(--muted);font-size:12px">No agents online</div>';
+    list.innerHTML = '<div style="padding:16px;color:var(--muted);font-size:12px">No agents yet</div>';
   }
 }
 
@@ -488,7 +509,7 @@ async function refreshActivity() {
         <tbody>
           ${data.rows.map(r => `
             <tr>
-              <td><span class="tag ${r.kind === 'active' ? 'tag-ok' : 'tag-warn'}">${esc(r.kind)}</span></td>
+              <td><span class="tag ${r.event_type === 'active' ? 'tag-ok' : 'tag-warn'}">${esc(r.event_type)}</span></td>
               <td>${r.idle_secs ?? '—'}</td>
               <td>${ts(r.ts)}</td>
             </tr>`).join('')}

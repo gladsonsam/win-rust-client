@@ -11,10 +11,11 @@ use uuid::Uuid;
 // ─── Agent info ───────────────────────────────────────────────────────────────
 
 /// Metadata for a currently-connected agent.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AgentConn {
-    pub id:           Uuid,
-    pub name:         String,
+    pub id: Uuid,
+    pub name: String,
     pub connected_at: DateTime<Utc>,
 }
 
@@ -62,23 +63,28 @@ pub struct AppState {
     /// `None` means the dashboard is open with no authentication.
     pub ui_password: Option<String>,
 
+    /// Shared secret for authenticating agents connecting to `/ws/agent`.
+    /// `None` means agents can connect without authentication (NOT recommended for prod).
+    pub agent_secret: Option<String>,
+
     /// Active dashboard session tokens (random UUIDs issued on login).
     /// Stored in memory only — reset when the server restarts.
     pub sessions: Mutex<HashSet<String>>,
 }
 
 impl AppState {
-    pub fn new(db: PgPool, ui_password: Option<String>) -> Self {
+    pub fn new(db: PgPool, ui_password: Option<String>, agent_secret: Option<String>) -> Self {
         let (tx, _) = broadcast::channel(4096);
         Self {
             db,
             tx,
-            agents:          Mutex::new(HashMap::new()),
-            frames:          Mutex::new(HashMap::new()),
-            agent_cmds:      Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
+            frames: Mutex::new(HashMap::new()),
+            agent_cmds: Mutex::new(HashMap::new()),
             capture_viewers: Mutex::new(HashMap::new()),
             ui_password,
-            sessions:        Mutex::new(HashSet::new()),
+            agent_secret,
+            sessions: Mutex::new(HashSet::new()),
         }
     }
 

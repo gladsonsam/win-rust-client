@@ -5,9 +5,9 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB:       monitor
-      POSTGRES_USER:     monitor
-      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB:       ${POSTGRES_DB:-monitor}
+      POSTGRES_USER:     ${POSTGRES_USER:-monitor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -16,22 +16,40 @@ services:
       timeout:  5s
       retries:  10
 
-  # ── Monitoring server ────────────────────────────────────────────────────────
+  # ── Sentinel Server ──────────────────────────────────────────────────────────
   server:
     build:
       context:    .
       dockerfile: server/Dockerfile
     restart: unless-stopped
-    ports:
-      - "9000:9000"     # Dashboard + agent WebSocket
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: postgres://monitor:changeme@db:5432/monitor
-      LISTEN_ADDR:  0.0.0.0:9000
-      RUST_LOG:     info
-      UI_PASSWORD:  changeme   # Set to a strong password; remove to disable auth
+      DATABASE_URL: postgres://${POSTGRES_USER:-monitor}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-monitor}
     depends_on:
       db:
         condition: service_healthy
 
+    # Direct exposure mode (no reverse proxy): set PUBLISH_PORT=9000 (or any host port).
+    ports:
+      - "${PUBLISH_PORT:-}:9000"
+
+    # Traefik mode: set TRAEFIK_ENABLE=true and attach to external network.
+    networks:
+      - default
+      - traefik
+    labels:
+      - traefik.enable=${TRAEFIK_ENABLE:-false}
+      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik}
+      - traefik.http.routers.sentinel.rule=Host(`${TRAEFIK_HOST:-sentinel.example.com}`)
+      - traefik.http.routers.sentinel.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.sentinel.tls=true
+      - traefik.http.routers.sentinel.tls.certresolver=${TRAEFIK_CERTRESOLVER:-cloudflare}
+      - traefik.http.services.sentinel.loadbalancer.server.port=9000
+
 volumes:
   pgdata:
+
+networks:
+  traefik:
+    external: true

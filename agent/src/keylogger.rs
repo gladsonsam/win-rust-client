@@ -1,4 +1,4 @@
-//! Keyboard monitoring with Unicode decoding, window-context buffering,
+//! Keyboard monitoring with Unicode decoding and window-context buffering.
 //! and smart AFK / Active transition detection.
 //!
 //! ## Architecture
@@ -33,22 +33,20 @@
 
 use std::sync::OnceLock;
 use tokio::sync::mpsc::UnboundedSender;
+use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardLayout, GetLastInputInfo, ToUnicodeEx,
-    VK_CAPITAL, VK_CONTROL, VK_MENU, VK_RMENU, VK_SHIFT, LASTINPUTINFO,
+    GetAsyncKeyState, GetKeyboardLayout, GetLastInputInfo, ToUnicodeEx, LASTINPUTINFO, VK_CAPITAL,
+    VK_CONTROL, VK_MENU, VK_RMENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowTextW,
+    GetWindowThreadProcessId, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK,
+    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
-use windows::core::PWSTR;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -121,7 +119,7 @@ unsafe fn decode_key(vk: u32, scan: u32) -> String {
         0x1B => return "[Esc]".into(),      // Escape
         0x2E => return "[Del]".into(),      // Delete
         0x20 => return " ".into(),          // Space
-        0x5B | 0x5C => return "[⊞]".into(),// Left / Right Win
+        0x5B | 0x5C => return "[⊞]".into(), // Left / Right Win
         // Keys we don't care to log
         0x25..=0x28 => return String::new(), // Arrow keys
         0x70..=0x87 => return String::new(), // F1-F24
@@ -132,8 +130,8 @@ unsafe fn decode_key(vk: u32, scan: u32) -> String {
 
     // ── Suppress pure Ctrl shortcuts (Ctrl+C, Ctrl+V, etc.) ──────────────
     // AltGr is encoded as Ctrl+RightAlt; allow that through.
-    let ctrl  = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) >> 15 != 0;
-    let altgr = (GetAsyncKeyState(VK_RMENU.0 as i32)   as u16) >> 15 != 0;
+    let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) >> 15 != 0;
+    let altgr = (GetAsyncKeyState(VK_RMENU.0 as i32) as u16) >> 15 != 0;
     if ctrl && !altgr {
         return String::new();
     }
@@ -152,12 +150,12 @@ unsafe fn decode_key(vk: u32, scan: u32) -> String {
     // AltGr (Right Alt) = Ctrl + Alt for ToUnicode
     if altgr {
         ks[VK_CONTROL.0 as usize] = 0x80;
-        ks[VK_MENU.0 as usize]    = 0x80;
-        ks[VK_RMENU.0 as usize]   = 0x80;
+        ks[VK_MENU.0 as usize] = 0x80;
+        ks[VK_RMENU.0 as usize] = 0x80;
     }
 
-    let mut buf    = [0u16; 4];
-    let     layout = GetKeyboardLayout(0);
+    let mut buf = [0u16; 4];
+    let layout = GetKeyboardLayout(0);
     let n = ToUnicodeEx(vk, scan, &ks, &mut buf, 0, layout);
 
     if n > 0 {
@@ -189,13 +187,8 @@ pub fn start(out_tx: UnboundedSender<InputEvent>) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("keylogger-hook".into())
         .spawn(|| unsafe {
-            let hook = SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(hook_proc),
-                HINSTANCE::default(),
-                0,
-            )
-            .expect("SetWindowsHookExW failed");
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), HINSTANCE::default(), 0)
+                .expect("SetWindowsHookExW failed");
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
@@ -219,16 +212,13 @@ pub fn start(out_tx: UnboundedSender<InputEvent>) -> anyhow::Result<()> {
 
 // ─── Decoder thread ───────────────────────────────────────────────────────────
 
-fn run_decoder(
-    raw_rx: std::sync::mpsc::Receiver<String>,
-    out_tx: UnboundedSender<InputEvent>,
-) {
+fn run_decoder(raw_rx: std::sync::mpsc::Receiver<String>, out_tx: UnboundedSender<InputEvent>) {
     use std::time::{Duration, Instant};
 
-    let mut buf      = String::new();
-    let mut cur_app  = String::new();
-    let mut cur_win  = String::new();
-    let timeout      = Duration::from_secs(FLUSH_TIMEOUT_SECS);
+    let mut buf = String::new();
+    let mut cur_app = String::new();
+    let mut cur_win = String::new();
+    let timeout = Duration::from_secs(FLUSH_TIMEOUT_SECS);
     let mut last_key = Instant::now();
 
     loop {
@@ -269,10 +259,10 @@ fn run_decoder(
 
 fn emit(text: &str, app: &str, win: &str, tx: &UnboundedSender<InputEvent>) {
     let _ = tx.send(InputEvent::Keys {
-        text:   text.to_owned(),
-        app:    app.to_owned(),
+        text: text.to_owned(),
+        app: app.to_owned(),
         window: win.to_owned(),
-        ts:     unix_ts(),
+        ts: unix_ts(),
     });
 }
 
@@ -289,9 +279,9 @@ async fn run_afk_watcher(out_tx: UnboundedSender<InputEvent>) {
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut was_afk          = false;
-    let mut last_input_tick  = 0u32;
-    let mut last_input_mono  = Instant::now();
+    let mut was_afk = false;
+    let mut last_input_tick = 0u32;
+    let mut last_input_mono = Instant::now();
 
     loop {
         ticker.tick().await;
@@ -345,7 +335,7 @@ fn foreground_window_info() -> (String, String) {
         let app = if pid != 0 {
             match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
                 Ok(handle) => {
-                    let mut buf  = [0u16; 1024];
+                    let mut buf = [0u16; 1024];
                     let mut size = buf.len() as u32;
                     let ok = QueryFullProcessImageNameW(
                         handle,
@@ -356,10 +346,7 @@ fn foreground_window_info() -> (String, String) {
                     let _ = CloseHandle(handle);
                     if ok.is_ok() {
                         let path = String::from_utf16_lossy(&buf[..size as usize]);
-                        path.rsplit(['\\', '/'])
-                            .next()
-                            .unwrap_or("")
-                            .to_string()
+                        path.rsplit(['\\', '/']).next().unwrap_or("").to_string()
                     } else {
                         String::new()
                     }

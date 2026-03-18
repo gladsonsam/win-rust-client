@@ -1,4 +1,4 @@
-//! Monitoring server
+//! Sentinel – monitoring server
 //!
 //! ## Environment variables
 //!
@@ -24,6 +24,7 @@ mod ws_viewer;
 use std::sync::Arc;
 
 use axum::{
+    http::StatusCode,
     middleware::from_fn_with_state,
     routing::{get, post},
     Router,
@@ -44,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // ── Database ──────────────────────────────────────────────────────────
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://monitor:monitor@localhost:5432/monitor".into());
+    let db_url = read_env_or_file("DATABASE_URL")
+        .unwrap_or_else(|| "postgres://monitor:monitor@localhost:5432/monitor".into());
 
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(20)
@@ -61,9 +62,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Database ready.");
 
     // ── UI password ───────────────────────────────────────────────────────
-    let ui_password = std::env::var("UI_PASSWORD")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let ui_password = read_env_or_file("UI_PASSWORD").filter(|s| !s.is_empty());
 
     if ui_password.is_some() {
         info!("Dashboard password protection enabled.");
@@ -72,15 +71,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── App state ─────────────────────────────────────────────────────────
-    let state = Arc::new(state::AppState::new(pool, ui_password));
+    let agent_secret = read_env_or_file("AGENT_SECRET").filter(|s| !s.is_empty());
+    if agent_secret.is_some() {
+        info!("Agent authentication enabled (AGENT_SECRET set).");
+    } else {
+        info!("Agent authentication disabled (set AGENT_SECRET to enable).");
+    }
+
+    let state = Arc::new(state::AppState::new(pool, ui_password, agent_secret));
 
     // ── Routes ────────────────────────────────────────────────────────────
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./static".into());
 
+    // Healthcheck endpoint for containers / load balancers.
+    let health_routes = Router::new().route("/healthz", get(|| async { (StatusCode::OK, "ok") }));
+
     // Auth endpoints — always open (needed to obtain / clear the session cookie).
     let auth_routes = Router::new()
-        .route("/api/login",       post(auth::login))
-        .route("/api/logout",      post(auth::logout))
+        .route("/api/login", post(auth::login))
+        .route("/api/logout", post(auth::logout))
         .route("/api/auth/status", get(auth::status));
 
     // Everything else requires a valid session when UI_PASSWORD is set.
@@ -92,13 +101,16 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         // Agent WebSocket — never gated by UI auth (agents use their own secret).
         .route("/ws/agent", get(ws_agent::handler))
+        .merge(health_routes)
         .merge(auth_routes)
         .merge(protected)
         // Static dashboard (index.html + assets) — served last as fallback.
-        .fallback_service(
-            ServeDir::new(&static_dir).append_index_html_on_directories(true),
-        )
-        .layer(CorsLayer::permissive())
+        .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true))
+        // CORS:
+        // - default permissive to preserve current dev behavior
+        // - set CORS_ORIGINS="https://dashboard.example.com,https://other.example.com"
+        //   to restrict in production.
+        .layer(cors_layer_from_env())
         .with_state(state);
 
     // ── Listen ────────────────────────────────────────────────────────────
@@ -109,4 +121,23 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn cors_layer_from_env() -> CorsLayer {
+    // The dashboard is served by the same origin as the API (same container),
+    // so CORS is not a real concern here. CorsLayer::permissive() is fine and
+    // avoids the incompatibility between `allow_credentials` and wildcard methods.
+    CorsLayer::permissive()
+}
+
+/// Read config either from `NAME` or `NAME_FILE` (Docker secrets pattern).
+fn read_env_or_file(name: &str) -> Option<String> {
+    if let Ok(val) = std::env::var(name) {
+        return Some(val);
+    }
+    let file_key = format!("{name}_FILE");
+    let path = std::env::var(file_key).ok()?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }

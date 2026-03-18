@@ -5,7 +5,8 @@ WORKDIR /frontend
 
 # Install deps first for better layer caching.
 COPY frontend/package.json ./
-RUN npm install
+# Note: no lockfile is committed yet, so we can't use `npm ci` here.
+RUN npm install --no-audit --no-fund
 
 # Build the app.
 COPY frontend/ ./
@@ -15,7 +16,7 @@ RUN npm run build
 # ── Stage 2: Build Rust server ────────────────────────────────────────────────
 # The agent/ directory is NOT a workspace member; no Windows deps present.
 
-FROM rust:latest AS builder
+FROM rust:1 AS builder
 
 WORKDIR /workspace
 
@@ -25,25 +26,25 @@ COPY server/Cargo.toml server/Cargo.toml
 
 RUN mkdir -p server/src \
  && echo 'fn main(){}' > server/src/main.rs \
- && cargo build --release --package server \
+ && cargo build --release --package sentinel-server \
     2>/dev/null || true \
  && rm -rf server/src
 
 # Real build – touch sources so Cargo rebuilds after the stub.
 COPY server/ server/
 RUN find server/src -name '*.rs' -exec touch {} + \
- && cargo build --release --package server
+ && cargo build --release --package sentinel-server
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY --from=builder   /workspace/target/release/server /app/server
+COPY --from=builder   /workspace/target/release/sentinel-server /app/sentinel-server
 # Serve the React SPA; migrations are embedded via sqlx::migrate!()
 COPY --from=frontend  /frontend/dist                   /app/static
 
@@ -52,4 +53,11 @@ ENV STATIC_DIR=/app/static \
 
 EXPOSE 9000
 
-ENTRYPOINT ["/app/server"]
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
+ && chown -R app:app /app
+
+USER 10001:10001
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=6 CMD curl -fsS http://127.0.0.1:9000/healthz || exit 1
+
+ENTRYPOINT ["/app/sentinel-server"]

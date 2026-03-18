@@ -38,13 +38,57 @@ pub async fn touch_agent(pool: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+// ─── Agent sessions (connection history) ──────────────────────────────────────
+
+/// Record a new WebSocket session for an agent. Returns the session row id.
+pub async fn start_agent_session(pool: &PgPool, agent_id: Uuid) -> Result<i64> {
+    let id: i64 =
+        sqlx::query_scalar(r#"INSERT INTO agent_sessions (agent_id) VALUES ($1) RETURNING id"#)
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(id)
+}
+
+/// Mark an agent session disconnected.
+pub async fn end_agent_session(pool: &PgPool, session_id: i64) -> Result<()> {
+    sqlx::query("UPDATE agent_sessions SET disconnected_at = NOW() WHERE id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Returns (last_connected_at, last_disconnected_at) for an agent.
+pub async fn agent_last_session_times(
+    pool: &PgPool,
+    agent_id: Uuid,
+) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            MAX(connected_at)    AS last_connected_at,
+            MAX(disconnected_at) AS last_disconnected_at
+        FROM agent_sessions
+        WHERE agent_id = $1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await?;
+
+    let last_connected_at: Option<DateTime<Utc>> = row.try_get("last_connected_at").ok();
+    let last_disconnected_at: Option<DateTime<Utc>> = row.try_get("last_disconnected_at").ok();
+    Ok((last_connected_at, last_disconnected_at))
+}
+
 // ─── Window events ────────────────────────────────────────────────────────────
 
 pub async fn insert_window(pool: &PgPool, agent: Uuid, v: &serde_json::Value) -> Result<()> {
     let title = v["title"].as_str().unwrap_or("");
-    let app   = v["app"].as_str().unwrap_or("");
-    let hwnd  = v["hwnd"].as_i64().unwrap_or(0);
-    let ts    = unix_to_dt(v["ts"].as_i64());
+    let app = v["app"].as_str().unwrap_or("");
+    let hwnd = v["hwnd"].as_i64().unwrap_or(0);
+    let ts = unix_to_dt(v["ts"].as_i64());
 
     sqlx::query(
         "INSERT INTO window_events (agent_id, title, app, hwnd, ts) VALUES ($1,$2,$3,$4,$5)",
@@ -65,10 +109,10 @@ pub async fn insert_window(pool: &PgPool, agent: Uuid, v: &serde_json::Value) ->
 /// Append text to an open session (same agent/app/window, updated ≤ 30 s ago).
 /// Creates a new session row if no open one exists.
 pub async fn upsert_keys(pool: &PgPool, agent: Uuid, v: &serde_json::Value) -> Result<()> {
-    let app    = v["app"].as_str().unwrap_or("");
+    let app = v["app"].as_str().unwrap_or("");
     let window = v["window"].as_str().unwrap_or("");
-    let text   = v["text"].as_str().unwrap_or("");
-    let ts     = unix_to_dt(v["ts"].as_i64());
+    let text = v["text"].as_str().unwrap_or("");
+    let ts = unix_to_dt(v["ts"].as_i64());
 
     let updated = sqlx::query(
         r#"
@@ -109,10 +153,10 @@ pub async fn upsert_keys(pool: &PgPool, agent: Uuid, v: &serde_json::Value) -> R
 
 /// Insert a URL visit, skipping exact consecutive duplicates for this agent.
 pub async fn insert_url(pool: &PgPool, agent: Uuid, v: &serde_json::Value) -> Result<()> {
-    let url     = v["url"].as_str().unwrap_or("");
-    let title   = v["title"].as_str();
+    let url = v["url"].as_str().unwrap_or("");
+    let title = v["title"].as_str();
     let browser = v["browser"].as_str();
-    let ts      = unix_to_dt(v["ts"].as_i64());
+    let ts = unix_to_dt(v["ts"].as_i64());
 
     // Skip if same URL as the most-recent visit for this agent.
     let last: Option<String> = sqlx::query_scalar(
@@ -143,9 +187,9 @@ pub async fn insert_url(pool: &PgPool, agent: Uuid, v: &serde_json::Value) -> Re
 // ─── Activity log ─────────────────────────────────────────────────────────────
 
 pub async fn insert_activity(pool: &PgPool, agent: Uuid, v: &serde_json::Value) -> Result<()> {
-    let kind      = v["type"].as_str().unwrap_or("");
+    let kind = v["type"].as_str().unwrap_or("");
     let idle_secs = v["idle_secs"].as_i64();
-    let ts        = unix_to_dt(v["ts"].as_i64());
+    let ts = unix_to_dt(v["ts"].as_i64());
 
     sqlx::query(
         "INSERT INTO activity_log (agent_id, event_type, idle_secs, ts) VALUES ($1,$2,$3,$4)",
@@ -163,19 +207,18 @@ pub async fn insert_activity(pool: &PgPool, agent: Uuid, v: &serde_json::Value) 
 // ─── List / query helpers (used by API) ───────────────────────────────────────
 
 pub async fn list_agents(pool: &PgPool) -> Result<Vec<serde_json::Value>> {
-    let rows = sqlx::query(
-        "SELECT id, name, first_seen, last_seen FROM agents ORDER BY last_seen DESC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT id, name, first_seen, last_seen FROM agents ORDER BY last_seen DESC")
+            .fetch_all(pool)
+            .await?;
 
     Ok(rows
         .iter()
         .map(|r| {
-            let id:    Uuid          = r.try_get("id").unwrap_or_default();
-            let name:  String        = r.try_get("name").unwrap_or_default();
+            let id: Uuid = r.try_get("id").unwrap_or_default();
+            let name: String = r.try_get("name").unwrap_or_default();
             let first: DateTime<Utc> = r.try_get("first_seen").unwrap_or_else(|_| Utc::now());
-            let last:  DateTime<Utc> = r.try_get("last_seen").unwrap_or_else(|_| Utc::now());
+            let last: DateTime<Utc> = r.try_get("last_seen").unwrap_or_else(|_| Utc::now());
             serde_json::json!({ "id": id, "name": name, "first_seen": first, "last_seen": last })
         })
         .collect())
@@ -200,10 +243,10 @@ pub async fn query_windows(
     Ok(rows
         .iter()
         .map(|r| {
-            let title: String        = r.try_get("title").unwrap_or_default();
-            let app:   String        = r.try_get("app").unwrap_or_default();
-            let hwnd:  i64           = r.try_get("hwnd").unwrap_or_default();
-            let ts:    DateTime<Utc> = r.try_get("ts").unwrap_or_else(|_| Utc::now());
+            let title: String = r.try_get("title").unwrap_or_default();
+            let app: String = r.try_get("app").unwrap_or_default();
+            let hwnd: i64 = r.try_get("hwnd").unwrap_or_default();
+            let ts: DateTime<Utc> = r.try_get("ts").unwrap_or_else(|_| Utc::now());
             serde_json::json!({ "title": title, "app": app, "hwnd": hwnd, "ts": ts })
         })
         .collect())
@@ -228,9 +271,9 @@ pub async fn query_keys(
     Ok(rows
         .iter()
         .map(|r| {
-            let app:        String        = r.try_get("app").unwrap_or_default();
-            let window:     String        = r.try_get("window_title").unwrap_or_default();
-            let text:       String        = r.try_get("text").unwrap_or_default();
+            let app: String = r.try_get("app").unwrap_or_default();
+            let window: String = r.try_get("window_title").unwrap_or_default();
+            let text: String = r.try_get("text").unwrap_or_default();
             let started_at: DateTime<Utc> = r.try_get("started_at").unwrap_or_else(|_| Utc::now());
             let updated_at: DateTime<Utc> = r.try_get("updated_at").unwrap_or_else(|_| Utc::now());
             serde_json::json!({
@@ -260,10 +303,10 @@ pub async fn query_urls(
     Ok(rows
         .iter()
         .map(|r| {
-            let url:     String          = r.try_get("url").unwrap_or_default();
-            let title:   Option<String>  = r.try_get("title").ok().flatten();
-            let browser: Option<String>  = r.try_get("browser").ok().flatten();
-            let ts:      DateTime<Utc>   = r.try_get("ts").unwrap_or_else(|_| Utc::now());
+            let url: String = r.try_get("url").unwrap_or_default();
+            let title: Option<String> = r.try_get("title").ok().flatten();
+            let browser: Option<String> = r.try_get("browser").ok().flatten();
+            let ts: DateTime<Utc> = r.try_get("ts").unwrap_or_else(|_| Utc::now());
             serde_json::json!({ "url": url, "title": title, "browser": browser, "ts": ts })
         })
         .collect())
@@ -288,9 +331,9 @@ pub async fn query_activity(
     Ok(rows
         .iter()
         .map(|r| {
-            let event_type: String       = r.try_get("event_type").unwrap_or_default();
-            let idle_secs:  Option<i64>  = r.try_get("idle_secs").ok().flatten();
-            let ts:         DateTime<Utc>= r.try_get("ts").unwrap_or_else(|_| Utc::now());
+            let event_type: String = r.try_get("event_type").unwrap_or_default();
+            let idle_secs: Option<i64> = r.try_get("idle_secs").ok().flatten();
+            let ts: DateTime<Utc> = r.try_get("ts").unwrap_or_else(|_| Utc::now());
             serde_json::json!({ "event_type": event_type, "idle_secs": idle_secs, "ts": ts })
         })
         .collect())

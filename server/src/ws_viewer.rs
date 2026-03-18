@@ -19,11 +19,11 @@
 
 use std::sync::Arc;
 
+use axum::extract::ws::WebSocket;
 use axum::{
     extract::{ws::Message, State, WebSocketUpgrade},
     response::IntoResponse,
 };
-use axum::extract::ws::WebSocket;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -31,28 +31,48 @@ use uuid::Uuid;
 use crate::state::{AppState, Broadcast};
 
 pub async fn handler(
-    ws:           WebSocketUpgrade,
+    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| run(socket, state))
 }
 
 async fn run(mut ws: WebSocket, state: Arc<AppState>) {
-    // ── Send initial agent list ───────────────────────────────────────────────
-    let agents: Vec<_> = {
-        let map = state.agents.lock().unwrap();
-        map.values()
-            .map(|a| {
-                serde_json::json!({
-                    "id":           a.id,
-                    "name":         a.name,
-                    "connected_at": a.connected_at,
-                })
-            })
-            .collect()
+    // ── Send initial agent list (includes offline agents + last session times) ──
+    let agents = match crate::db::list_agents(&state.db).await {
+        Ok(rows) => rows,
+        Err(_) => Vec::new(),
     };
 
-    let init = serde_json::json!({ "event": "init", "agents": agents }).to_string();
+    let online: std::collections::HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = {
+        let map = state.agents.lock().unwrap();
+        map.iter().map(|(id, a)| (*id, a.connected_at)).collect()
+    };
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(agents.len());
+    for a in agents {
+        let id = match a["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let (last_connected_at, last_disconnected_at) =
+            crate::db::agent_last_session_times(&state.db, id)
+                .await
+                .unwrap_or((None, None));
+        let connected_at = online.get(&id).copied();
+        out.push(serde_json::json!({
+            "id": id,
+            "name": a["name"],
+            "first_seen": a["first_seen"],
+            "last_seen": a["last_seen"],
+            "online": connected_at.is_some(),
+            "connected_at": connected_at,
+            "last_connected_at": last_connected_at,
+            "last_disconnected_at": last_disconnected_at
+        }));
+    }
+
+    let init = serde_json::json!({ "event": "init", "agents": out }).to_string();
     if ws.send(Message::Text(init)).await.is_err() {
         return;
     }
