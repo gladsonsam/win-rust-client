@@ -8,6 +8,9 @@ target/
 # Node deps (copied from package.json during Docker build instead)
 frontend/node_modules/
 
+# Old server-bundled UI (now built in Dockerfile)
+server/static/
+
 # Git / dev files
 .git/
 *.md

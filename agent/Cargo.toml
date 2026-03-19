@@ -45,9 +45,13 @@ browser-url = "0.1"
 # ── Input injection ───────────────────────────────────────────────────────────
 enigo = "0.2"
 
+# ── Notifications (Windows toast) ──────────────────────────────────────────────
+winrt-notification = "0.5.1"
+
 # ── Tauri (webview settings window) ──────────────────────────────────────────
 tauri = { version = "2", features = [] }
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
 
 # ── Windows API (keylogger + window tracker) ──────────────────────────────────────────
 windows = { version = "0.58", features = [
@@ -76,6 +80,10 @@ sha2 = "0.10"
 
 # ── Platform directories (AppData) ───────────────────────────────────────────
 dirs = "6"
+
+# ── System / network info ─────────────────────────────────────────────────────
+sysinfo = "0.37"
+ipconfig = "0.3"
 
 
 # ── Build dependencies ───────────────────────────────────────────────────────

@@ -48,6 +48,29 @@ export interface ActivityEvent {
   ts: string;
 }
 
+export interface NetworkAdapterInfo {
+  name?: string;
+  description?: string;
+  mac?: string;
+  ips?: string[];
+  gateways?: string[];
+  dns?: string[];
+}
+
+export interface AgentInfo {
+  hostname?: string;
+  os_name?: string;
+  os_version?: string | null;
+  os_long_version?: string | null;
+  kernel_version?: string | null;
+  cpu_brand?: string;
+  cpu_cores?: number;
+  memory_total_mb?: number;
+  memory_used_mb?: number;
+  adapters?: NetworkAdapterInfo[];
+  ts?: number;
+}
+
 // ── WebSocket event envelope ──────────────────────────────────────────────────
 //
 // The WS viewer sends `event` for its own envelopes (init).
@@ -56,8 +79,9 @@ export interface ActivityEvent {
 export type WsEvent =
   | { event: "init"; agents: Agent[] }
   | { event: "agent_connected"; agent_id: string; name: string; connected_at: string }
-  | { event: "agent_disconnected"; agent_id: string }
+  | { event: "agent_disconnected"; agent_id: string; disconnected_at?: string }
   | { event: "window_focus"; agent_id: string; title?: string; app?: string }
+  | { event: "agent_info"; agent_id: string; data?: AgentInfo }
   | {
       event: "keys";
       agent_id: string;
@@ -71,4 +95,4 @@ export type WsEvent =
 
 // ── UI ────────────────────────────────────────────────────────────────────────
 
-export type TabKey = "screen" | "keys" | "windows" | "urls" | "activity";
+export type TabKey = "specs" | "screen" | "keys" | "windows" | "urls" | "activity";

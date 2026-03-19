@@ -22,9 +22,10 @@
 //! ```
 
 use anyhow::{Context, Result};
-use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Key, Mouse, Settings};
 use serde::Deserialize;
 use tracing::info;
+use winrt_notification::Toast;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types (deserialised from inbound JSON)
@@ -68,6 +69,26 @@ pub enum ControlCommand {
         #[serde(default)]
         button: MouseButton,
     },
+
+    /// Type literal text into the currently focused window.
+    ///
+    /// Sent by the dashboard when remote control is enabled and the user types.
+    TypeText { text: String },
+
+    /// Press a special key (Enter, Backspace, etc).
+    KeyPress { key: SpecialKey },
+
+    /// Display a user-visible notification on the agent machine.
+    Notify { title: String, message: String },
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpecialKey {
+    Enter,
+    Backspace,
+    Tab,
+    Escape,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,6 +152,44 @@ impl InputController {
                 self.enigo
                     .button(button.into(), Direction::Click)
                     .context("button click failed")?;
+            }
+
+            // ── Typing ───────────────────────────────────────────────────────
+            ControlCommand::TypeText { text } => {
+                if text.is_empty() {
+                    return Ok(());
+                }
+                info!("→ TypeText  len={}", text.chars().count());
+                self.enigo.text(&text).context("text failed")?;
+            }
+
+            ControlCommand::KeyPress { key } => {
+                info!("→ KeyPress  key={key:?}");
+                let k = match key {
+                    SpecialKey::Enter => Key::Return,
+                    SpecialKey::Backspace => Key::Backspace,
+                    SpecialKey::Tab => Key::Tab,
+                    SpecialKey::Escape => Key::Escape,
+                };
+                self.enigo.key(k, Direction::Click).context("key press failed")?;
+            }
+
+            // ── Notification ────────────────────────────────────────────────
+            ControlCommand::Notify { title, message } => {
+                let title = title.trim();
+                let message = message.trim();
+                if title.is_empty() && message.is_empty() {
+                    return Ok(());
+                }
+
+                // Compatibility fallback: uses the PowerShell AUMID so toasts work
+                // without any install/shortcut registration steps.
+                let mut t = Toast::new(Toast::POWERSHELL_APP_ID);
+                t = t.title(if title.is_empty() { "Sentinel" } else { title });
+                if !message.is_empty() {
+                    t = t.text1(message);
+                }
+                let _ = t.show();
             }
         }
 

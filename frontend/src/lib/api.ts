@@ -4,6 +4,7 @@ import type {
   KeySession,
   UrlVisit,
   ActivityEvent,
+  AgentInfo,
 } from "./types";
 
 interface PageParams {
@@ -76,6 +77,20 @@ export const api = {
     { limit = 100, offset = 0 }: PageParams = {},
   ): Promise<{ rows: ActivityEvent[] }> =>
     get(`/api/agents/${id}/activity?limit=${limit}&offset=${offset}`),
+
+  agentInfo: (id: string): Promise<{ info: AgentInfo | null }> =>
+    get(`/api/agents/${id}/info`),
+
+  // ── Destructive actions ────────────────────────────────────────────────
+  /** Clear all stored telemetry history for this agent (windows/keys/urls/activity). */
+  clearAgentHistory: async (id: string): Promise<{ cleared_rows: number }> => {
+    const res = await fetch(`/api/agents/${id}/history/clear`, { method: "POST" });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error ?? `HTTP ${res.status}`);
+    }
+    return (await res.json()) as { cleared_rows: number };
+  },
 
   mjpegUrl: (id: string) => `/api/agents/${id}/mjpeg`,
 };

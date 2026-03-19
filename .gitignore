@@ -17,12 +17,14 @@ secrets/*.txt
 /agent/patches/*/Cargo.lock
 
 # ── Local scripts ────────────────────────────────────────────────────────────
-move.sh
-
+/scripts/
 # ── Frontend ─────────────────────────────────────────────────────────────────
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+
+# ── Server static (built dashboard bundle) ────────────────────────────────────
+server/static/
 
 # ── IDE / OS ─────────────────────────────────────────────────────────────────
 .DS_Store

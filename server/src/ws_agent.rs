@@ -193,6 +193,7 @@ async fn dispatch_text(text: &str, agent_id: uuid::Uuid, name: &str, state: &Arc
         "window_focus" => db::insert_window(&state.db, agent_id, &val).await,
         "url" => db::insert_url(&state.db, agent_id, &val).await,
         "afk" | "active" => db::insert_activity(&state.db, agent_id, &val).await,
+        "agent_info" => db::upsert_agent_info(&state.db, agent_id, &val).await,
         other => {
             warn!("Unknown event type '{other}' from {agent_id}");
             Ok(())

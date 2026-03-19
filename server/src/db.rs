@@ -38,6 +38,33 @@ pub async fn touch_agent(pool: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// Upsert the latest system/specs snapshot for an agent.
+pub async fn upsert_agent_info(pool: &PgPool, agent_id: Uuid, info: &serde_json::Value) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO agent_info (agent_id, info, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (agent_id)
+        DO UPDATE SET info = EXCLUDED.info, updated_at = NOW()
+        "#,
+    )
+    .bind(agent_id)
+    .bind(info)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch the latest stored system/specs snapshot for an agent (if any).
+pub async fn get_agent_info(pool: &PgPool, agent_id: Uuid) -> Result<Option<serde_json::Value>> {
+    let row = sqlx::query("SELECT info FROM agent_info WHERE agent_id = $1")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.and_then(|r| r.try_get::<serde_json::Value, _>("info").ok()))
+}
+
 // ─── Agent sessions (connection history) ──────────────────────────────────────
 
 /// Record a new WebSocket session for an agent. Returns the session row id.
@@ -337,6 +364,49 @@ pub async fn query_activity(
             serde_json::json!({ "event_type": event_type, "idle_secs": idle_secs, "ts": ts })
         })
         .collect())
+}
+
+/// Clear all telemetry history for an agent while keeping the `agents` row.
+///
+/// This is used by the dashboard "clear history" UX so operators can
+/// selectively wipe what they previously recorded for a single client.
+pub async fn clear_agent_history(pool: &PgPool, agent: Uuid) -> Result<u64> {
+    // Note: we intentionally do NOT delete from `agents` (the sidebar needs it).
+    // Deleting telemetry rows keeps foreign keys simple (each table already
+    // references `agents(id)` with ON DELETE CASCADE).
+    let win = sqlx::query("DELETE FROM window_events WHERE agent_id = $1")
+        .bind(agent)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    let keys = sqlx::query("DELETE FROM key_sessions WHERE agent_id = $1")
+        .bind(agent)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    let urls = sqlx::query("DELETE FROM url_visits WHERE agent_id = $1")
+        .bind(agent)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    let activity = sqlx::query("DELETE FROM activity_log WHERE agent_id = $1")
+        .bind(agent)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    // Also clear websocket connection history so "last seen" becomes empty.
+    // If you prefer to keep last-seen timestamps, remove this query.
+    let sessions = sqlx::query("DELETE FROM agent_sessions WHERE agent_id = $1")
+        .bind(agent)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    Ok(win.saturating_add(keys).saturating_add(urls).saturating_add(activity).saturating_add(sessions))
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────

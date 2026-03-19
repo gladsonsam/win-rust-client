@@ -172,6 +172,15 @@ pub fn run_tauri(
     show_on_startup: bool,
 ) {
     tauri::Builder::default()
+        // Ensure only one instance of the agent settings app runs.
+        // If a second instance is launched, we focus/show the existing window
+        // and the new instance exits automatically via the plugin.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         // ── Plugins ─────────────────────────────────────────────────────────
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // ── Shared state ────────────────────────────────────────────────────

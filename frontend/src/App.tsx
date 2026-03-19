@@ -5,6 +5,7 @@ import {
   Globe,
   Layout,
   Activity,
+  Info,
   Wifi,
   WifiOff,
   Loader2,
@@ -26,11 +27,12 @@ import { ActivityTab } from "./components/ActivityTab";
 import { LoginPage } from "./components/LoginPage";
 import { cn } from "./lib/utils";
 import { api } from "./lib/api";
-import type { Agent, AgentLiveStatus, TabKey, WsEvent } from "./lib/types";
+import type { Agent, AgentInfo, AgentLiveStatus, TabKey, WsEvent } from "./lib/types";
 
 // ── Tab definitions ───────────────────────────────────────────────────────────
 
 const TABS: { key: TabKey; label: string; Icon: typeof Monitor }[] = [
+  { key: "specs", label: "Specs", Icon: Info },
   { key: "screen", label: "Screen", Icon: Monitor },
   { key: "keys", label: "Keys", Icon: Keyboard },
   { key: "windows", label: "Windows", Icon: Layout },
@@ -47,9 +49,12 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [liveStatus, setLiveStatus] = useState<Record<string, AgentLiveStatus>>(
     {},
   );
+  const [agentInfo, setAgentInfo] = useState<Record<string, AgentInfo | null>>(
+    {},
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<"overview" | "detail">("overview");
-  const [activeTab, setActiveTab] = useState<TabKey>("screen");
+  const [activeTab, setActiveTab] = useState<TabKey>("specs");
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -104,6 +109,14 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     }, 3000);
   }, []);
 
+  const forceRefresh = useCallback(() => {
+    if (refreshTimer.current) {
+      clearTimeout(refreshTimer.current);
+      refreshTimer.current = null;
+    }
+    setRefreshKey((k) => k + 1);
+  }, []);
+
   // ── WebSocket event handler ────────────────────────────────────────────────
 
   const handleMessage = useCallback(
@@ -135,18 +148,29 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         case "agent_disconnected":
           setAgents((prev) => {
             const n = { ...prev };
-            delete n[ev.agent_id];
+            const existing = n[ev.agent_id];
+            if (!existing) return n;
+            const disconnectedAt = ev.disconnected_at ?? new Date().toISOString();
+            n[ev.agent_id] = {
+              ...existing,
+              online: false,
+              connected_at: null,
+              last_seen: disconnectedAt,
+              last_disconnected_at: disconnectedAt,
+            };
             return n;
           });
-          if (selectedRef.current === ev.agent_id) {
-            setView("overview");
-            setSelectedId(null);
-          }
           break;
 
         case "window_focus":
           updateLiveStatus(ev.agent_id, { window: ev.title, app: ev.app });
           scheduleRefresh(ev.agent_id);
+          break;
+
+        case "agent_info":
+          if (ev.data) {
+            setAgentInfo((prev) => ({ ...prev, [ev.agent_id]: ev.data ?? null }));
+          }
           break;
 
         case "url":
@@ -196,7 +220,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const selectAgent = useCallback((id: string) => {
     setSelectedId(id);
     setView("detail");
-    setActiveTab("screen");
+    setActiveTab("specs");
     setRefreshKey(0);
     setSidebarOpen(false);
   }, []);
@@ -215,6 +239,22 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   }, [onLogout]);
 
   const selectedAgent = selectedId ? agents[selectedId] : null;
+  const selectedAgentInfo = selectedId ? agentInfo[selectedId] : null;
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let cancelled = false;
+    api
+      .agentInfo(selectedId)
+      .then((d) => {
+        if (cancelled) return;
+        setAgentInfo((prev) => ({ ...prev, [selectedId]: d.info ?? null }));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -368,10 +408,14 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
               <div className="flex-1 overflow-auto p-3 md:p-4">
                 {selectedId && (
                   <>
+                    {activeTab === "specs" && (
+                      <AgentInfoPanel agent={selectedAgent} info={selectedAgentInfo} />
+                    )}
                     {activeTab === "screen" && (
                       <ScreenTab
                         key={selectedId}
                         agentId={selectedId}
+                        online={selectedAgent?.online ?? false}
                         onControl={sendControl}
                       />
                     )}
@@ -391,6 +435,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
                       <ActivityTab
                         agentId={selectedId}
                         refreshKey={refreshKey}
+                        onHistoryCleared={forceRefresh}
                       />
                     )}
                   </>
@@ -399,6 +444,78 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
             </>
           )}
         </main>
+      </div>
+    </div>
+  );
+}
+
+function fmtMb(mb?: number) {
+  if (typeof mb !== "number" || !Number.isFinite(mb)) return "—";
+  return `${Math.round(mb)} MB`;
+}
+
+function AgentInfoPanel({
+  agent,
+  info,
+}: {
+  agent: Agent | null;
+  info: AgentInfo | null | undefined;
+}) {
+  if (!agent) return null;
+
+  const adapters = info?.adapters ?? [];
+  const primaryIps =
+    adapters.flatMap((a) => a.ips ?? []).filter(Boolean).slice(0, 6) ?? [];
+
+  return (
+    <div className="bg-surface border-b border-border px-3 md:px-4 py-3">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="rounded-lg border border-border bg-bg/20 px-3 py-2">
+          <div className="text-[11px] uppercase tracking-widest text-muted font-semibold">
+            Computer
+          </div>
+          <div className="mt-1 text-sm font-medium">
+            {info?.hostname ?? agent.name}
+          </div>
+          <div className="mt-0.5 text-xs text-muted truncate">
+            {info?.os_long_version ?? info?.os_name ?? "—"}
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-border bg-bg/20 px-3 py-2">
+          <div className="text-[11px] uppercase tracking-widest text-muted font-semibold">
+            Specs
+          </div>
+          <div className="mt-1 text-xs text-muted">
+            <div className="truncate">
+              <span className="text-primary">CPU:</span>{" "}
+              {info?.cpu_brand
+                ? `${info.cpu_brand}${info.cpu_cores ? ` (${info.cpu_cores} cores)` : ""}`
+                : "—"}
+            </div>
+            <div className="truncate">
+              <span className="text-primary">RAM:</span>{" "}
+              {fmtMb(info?.memory_used_mb)} / {fmtMb(info?.memory_total_mb)}
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-border bg-bg/20 px-3 py-2">
+          <div className="text-[11px] uppercase tracking-widest text-muted font-semibold">
+            Network
+          </div>
+          <div className="mt-1 text-xs text-muted">
+            {primaryIps.length === 0 ? (
+              <div>—</div>
+            ) : (
+              primaryIps.map((ip) => (
+                <div key={ip} className="font-mono truncate">
+                  {ip}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
