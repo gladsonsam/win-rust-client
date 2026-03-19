@@ -30,9 +30,16 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["msi"],
     "icon": [
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "wix": {
+        "fragmentPaths": ["./wix/fragments/run-at-logon.wxs"],
+        "componentRefs": ["SentinelRunOnLogon"]
+      }
+    }
   }
 }

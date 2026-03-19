@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- Adds auto-start on logon for ALL users (per-machine) -->
+    <DirectoryRef Id="TARGETDIR">
+      <Component Id="SentinelRunOnLogon" Guid="*">
+        <RegistryKey
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Action="createAndRemoveOnUninstall"
+        >
+          <RegistryValue
+            Type="string"
+            Name="SentinelAgent"
+            Value="&quot;[INSTALLDIR]sentinel-agent.exe&quot;"
+            KeyPath="yes"
+          />
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>
+
