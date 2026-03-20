@@ -27,6 +27,17 @@ use tracing::{error, info, warn};
 
 use crate::{db, state::{AppState, Frame}};
 
+// Conservative bounds to mitigate memory/DB-flood DoS.
+// These can be tuned later (or moved to env/config).
+const MAX_AGENT_NAME_CHARS: usize = 128;
+const MAX_AGENT_TEXT_BYTES: usize = 128 * 1024; // JSON events
+const MAX_AGENT_BINARY_BYTES: usize = 8 * 1024 * 1024; // JPEG frames
+
+const MAX_KEYS_TEXT_CHARS: usize = 4_000;
+const MAX_URL_STR_BYTES: usize = 4_096;
+const MAX_WINDOW_TITLE_CHARS: usize = 512;
+const MAX_WINDOW_APP_CHARS: usize = 256;
+
 // ─── Connection handshake ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -44,15 +55,27 @@ pub async fn handler(
     // Enforce agent authentication when configured.
     if let Some(expected) = state.agent_secret.as_deref() {
         let provided = params.secret.as_deref().unwrap_or("");
-        
+
         // Secure timing attack mitigation with constant-time equality.
         let is_equal = subtle::ConstantTimeEq::ct_eq(provided.as_bytes(), expected.as_bytes());
         if !bool::from(is_equal) {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
+    } else if !state.allow_insecure_agent_auth {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Agent auth not configured (set AGENT_SECRET)",
+        )
+            .into_response();
     }
 
-    let name = params.name.unwrap_or_else(|| "unknown".into());
+    let name = params
+        .name
+        .unwrap_or_else(|| "unknown".into())
+        .trim()
+        .chars()
+        .take(MAX_AGENT_NAME_CHARS)
+        .collect::<String>();
     ws.on_upgrade(move |socket| run(socket, name, state))
 }
 
@@ -139,6 +162,14 @@ async fn run(mut ws: WebSocket, name: String, state: Arc<AppState>) {
             msg = ws.recv() => {
                 match msg {
                     Some(Ok(Message::Binary(bytes))) => {
+                        if bytes.len() > MAX_AGENT_BINARY_BYTES {
+                            warn!(
+                                "Dropping agent {agent_id}: frame too large ({} bytes)",
+                                bytes.len()
+                            );
+                            break;
+                        }
+
                         // Cache the latest screenshot frame with a monotonically increasing sequence.
                         let mut frames = state.frames.lock().unwrap();
                         let next_seq = frames.get(&agent_id).map(|f| f.seq.saturating_add(1)).unwrap_or(1);
@@ -151,6 +182,13 @@ async fn run(mut ws: WebSocket, name: String, state: Arc<AppState>) {
                         );
                     }
                     Some(Ok(Message::Text(text))) => {
+                        if text.len() > MAX_AGENT_TEXT_BYTES {
+                            warn!(
+                                "Dropping agent {agent_id}: text frame too large ({} bytes)",
+                                text.len()
+                            );
+                            break;
+                        }
                         dispatch_text(text.as_str(), agent_id, &name, &state).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -228,9 +266,46 @@ async fn dispatch_text(text: &str, agent_id: uuid::Uuid, name: &str, state: &Arc
     let kind = val["type"].as_str().unwrap_or("");
 
     let result = match kind {
-        "keys" => db::upsert_keys(&state.db, agent_id, &val).await,
-        "window_focus" => db::insert_window(&state.db, agent_id, &val).await,
-        "url" => db::insert_url(&state.db, agent_id, &val).await,
+        "keys" => {
+            let too_long = val["text"]
+                .as_str()
+                .map(|s| s.chars().count() > MAX_KEYS_TEXT_CHARS)
+                .unwrap_or(false);
+            if too_long {
+                warn!("Dropping 'keys' event from {agent_id}: text too large");
+                Ok(())
+            } else {
+                db::upsert_keys(&state.db, agent_id, &val).await
+            }
+        }
+        "window_focus" => {
+            let title_ok = val["title"]
+                .as_str()
+                .map(|s| s.chars().count() <= MAX_WINDOW_TITLE_CHARS)
+                .unwrap_or(true);
+            let app_ok = val["app"]
+                .as_str()
+                .map(|s| s.chars().count() <= MAX_WINDOW_APP_CHARS)
+                .unwrap_or(true);
+            if !title_ok || !app_ok {
+                warn!("Dropping 'window_focus' event from {agent_id}: title/app too large");
+                Ok(())
+            } else {
+                db::insert_window(&state.db, agent_id, &val).await
+            }
+        }
+        "url" => {
+            let url_ok = val["url"]
+                .as_str()
+                .map(|s| s.len() <= MAX_URL_STR_BYTES)
+                .unwrap_or(true);
+            if !url_ok {
+                warn!("Dropping 'url' event from {agent_id}: url too large");
+                Ok(())
+            } else {
+                db::insert_url(&state.db, agent_id, &val).await
+            }
+        }
         "afk" | "active" => db::insert_activity(&state.db, agent_id, &val).await,
         "agent_info" => db::upsert_agent_info(&state.db, agent_id, &val).await,
         other => {

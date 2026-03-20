@@ -30,6 +30,14 @@ use uuid::Uuid;
 
 use crate::state::{AppState, Broadcast};
 
+// Conservative bounds for viewer -> server control messages.
+// This prevents large JSON objects from turning into expensive parses or
+// unbounded command payload forwarding.
+const MAX_VIEWER_TEXT_BYTES: usize = 64 * 1024;
+const MAX_TYPE_TEXT_CHARS: usize = 2_000;
+const MAX_NOTIFY_TITLE_CHARS: usize = 64;
+const MAX_NOTIFY_MESSAGE_CHARS: usize = 256;
+
 pub async fn handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -116,6 +124,14 @@ async fn run(mut ws: WebSocket, state: Arc<AppState>) {
 // ─── Viewer → agent control forwarding ───────────────────────────────────────
 
 fn handle_viewer_message(text: &str, state: &Arc<AppState>) {
+    if text.len() > MAX_VIEWER_TEXT_BYTES {
+        warn!(
+            "Dropping viewer message: payload too large ({} bytes)",
+            text.len()
+        );
+        return;
+    }
+
     let Ok(val) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -130,6 +146,62 @@ fn handle_viewer_message(text: &str, state: &Arc<AppState>) {
     let Ok(agent_id) = agent_id_str.parse::<Uuid>() else {
         return;
     };
+
+    // Validate command "shape" before forwarding to the agent.
+    let cmd_type = val["cmd"]["type"].as_str().unwrap_or("");
+    let cmd_ok = match cmd_type {
+        "MouseMove" => {
+            let x_ok = val["cmd"]["x"]
+                .as_i64()
+                .map(|v| v >= i32::MIN as i64 && v <= i32::MAX as i64)
+                .unwrap_or(false);
+            let y_ok = val["cmd"]["y"]
+                .as_i64()
+                .map(|v| v >= i32::MIN as i64 && v <= i32::MAX as i64)
+                .unwrap_or(false);
+            x_ok && y_ok
+        }
+        "MouseClick" => {
+            let x_ok = val["cmd"]["x"]
+                .as_i64()
+                .map(|v| v >= i32::MIN as i64 && v <= i32::MAX as i64)
+                .unwrap_or(false);
+            let y_ok = val["cmd"]["y"]
+                .as_i64()
+                .map(|v| v >= i32::MIN as i64 && v <= i32::MAX as i64)
+                .unwrap_or(false);
+            let button_ok = val["cmd"]["button"]
+                .as_str()
+                .map(|b| matches!(b, "left" | "right" | "middle"))
+                .unwrap_or(true); // omitted => defaults to "left" in the agent
+            x_ok && y_ok && button_ok
+        }
+        "TypeText" => val["cmd"]["text"]
+            .as_str()
+            .map(|s| s.chars().count() <= MAX_TYPE_TEXT_CHARS)
+            .unwrap_or(false),
+        "KeyPress" => val["cmd"]["key"]
+            .as_str()
+            .map(|k| matches!(k, "enter" | "backspace" | "tab" | "escape"))
+            .unwrap_or(false),
+        "Notify" => {
+            let title_ok = val["cmd"]["title"]
+                .as_str()
+                .map(|s| s.chars().count() <= MAX_NOTIFY_TITLE_CHARS)
+                .unwrap_or(false);
+            let msg_ok = val["cmd"]["message"]
+                .as_str()
+                .map(|s| s.chars().count() <= MAX_NOTIFY_MESSAGE_CHARS)
+                .unwrap_or(false);
+            title_ok && msg_ok
+        }
+        _ => false,
+    };
+
+    if !cmd_ok {
+        warn!("Dropping viewer control command: invalid cmd type/shape");
+        return;
+    }
 
     // Serialise just the `cmd` sub-object and forward it to the agent.
     let cmd = serde_json::to_string(&val["cmd"]).unwrap_or_default();

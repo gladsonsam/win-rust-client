@@ -128,11 +128,27 @@ fn default_limit() -> i64 {
     50
 }
 
+fn validate_page_params(p: &PageParams) -> Result<(), &'static str> {
+    // Keep pagination bounded to avoid DB-heavy queries from untrusted clients.
+    // (This is still protected by cookie auth for the dashboard API.)
+    // The dashboard UI requests limit=500 for URL/Key history pages.
+    if !(1..=1000).contains(&p.limit) {
+        return Err("limit must be between 1 and 1000");
+    }
+    if p.offset < 0 || p.offset > 100_000 {
+        return Err("offset must be between 0 and 100000");
+    }
+    Ok(())
+}
+
 async fn agent_windows(
     Path(id): Path<Uuid>,
     Query(p): Query<PageParams>,
     State(s): State<Arc<AppState>>,
 ) -> Response {
+    if let Err(msg) = validate_page_params(&p) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     match db::query_windows(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
         Err(e) => err500(e),
@@ -144,6 +160,9 @@ async fn agent_keys(
     Query(p): Query<PageParams>,
     State(s): State<Arc<AppState>>,
 ) -> Response {
+    if let Err(msg) = validate_page_params(&p) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     match db::query_keys(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
         Err(e) => err500(e),
@@ -155,6 +174,9 @@ async fn agent_urls(
     Query(p): Query<PageParams>,
     State(s): State<Arc<AppState>>,
 ) -> Response {
+    if let Err(msg) = validate_page_params(&p) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     match db::query_urls(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
         Err(e) => err500(e),
@@ -166,6 +188,9 @@ async fn agent_activity(
     Query(p): Query<PageParams>,
     State(s): State<Arc<AppState>>,
 ) -> Response {
+    if let Err(msg) = validate_page_params(&p) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     match db::query_activity(&s.db, id, p.limit, p.offset).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
         Err(e) => err500(e),

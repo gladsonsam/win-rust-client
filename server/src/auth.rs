@@ -36,16 +36,30 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     if state.ui_password.is_none() {
-        return next.run(req).await;
+        return if state.allow_insecure_dashboard_open {
+            next.run(req).await
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Dashboard auth not configured" })),
+            )
+                .into_response()
+        };
     }
 
-    let authenticated = extract_session(req.headers())
-        .map(|t| state.sessions.lock().unwrap().contains(&t))
-        .unwrap_or(false);
+    let extracted_session = extract_session(req.headers());
+    let authenticated = match extracted_session {
+        Some(t) => match state.sessions.lock() {
+            Ok(guard) => guard.contains(&t),
+            Err(_) => false, // lock poisoned: fail closed
+        },
+        None => false,
+    };
 
     if authenticated {
         next.run(req).await
     } else {
+        // Fail closed: don't log session tokens.
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Unauthorized" })),
@@ -68,8 +82,16 @@ pub async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let Some(ref expected) = state.ui_password else {
-        // No password configured — always succeed without a cookie.
-        return Json(serde_json::json!({ "ok": true })).into_response();
+        if state.allow_insecure_dashboard_open {
+            // No password configured — always succeed without a cookie.
+            return Json(serde_json::json!({ "ok": true })).into_response();
+        }
+
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "UI_PASSWORD not configured" })),
+        )
+            .into_response();
     };
 
     // Secure timing attack mitigation with constant-time equality.
@@ -83,7 +105,15 @@ pub async fn login(
     }
 
     let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.lock().unwrap().insert(token.clone());
+    if let Ok(mut sessions) = state.sessions.lock() {
+        sessions.insert(token.clone());
+    } else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Session store unavailable" })),
+        )
+            .into_response();
+    }
     info!("New dashboard session created.");
 
     // Auto-detect HTTPS from Traefik's X-Forwarded-Proto header, or fall back
@@ -99,12 +129,19 @@ pub async fn login(
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
 
+    // Use SameSite=None when Secure is set so the cookie is sent on
+    // non-top-level requests (including WebSocket upgrades) in more
+    // deployment/proxy scenarios.
+    //
+    // Browsers require Secure when SameSite=None; we only emit None in the
+    // Secure branch.
     let cookie = if secure {
         format!(
-            "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
+            "session={}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=86400",
             token,
         )
     } else {
+        // Local development / HTTP: keep a restrictive default.
         format!(
             "session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
             token,
@@ -120,10 +157,27 @@ pub async fn login(
 /// `POST /api/logout` — revoke the current session cookie.
 pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(token) = extract_session(&headers) {
-        state.sessions.lock().unwrap().remove(&token);
+        if let Ok(mut sessions) = state.sessions.lock() {
+            sessions.remove(&token);
+        }
         info!("Dashboard session revoked.");
     }
-    let clear = "session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let secure = forwarded_proto == "https"
+        || std::env::var("COOKIE_SECURE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+
+    let clear = if secure {
+        "session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0"
+    } else {
+        "session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+    };
     (
         [(header::SET_COOKIE, HeaderValue::from_static(clear))],
         StatusCode::OK,
@@ -133,19 +187,33 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 
 /// `GET /api/auth/status` — let the SPA check whether it is already authenticated.
 pub async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let password_required = state.ui_password.is_some();
+    if state.ui_password.is_none() {
+        if state.allow_insecure_dashboard_open {
+            return Json(serde_json::json!({
+                "authenticated":     true,
+                "password_required": false,
+            }))
+            .into_response();
+        }
 
-    if !password_required {
-        return Json(serde_json::json!({
-            "authenticated":     true,
-            "password_required": false,
-        }))
-        .into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "authenticated":     false,
+                "password_required": true,
+                "error":             "UI_PASSWORD not configured",
+            })),
+        )
+            .into_response();
     }
 
-    let authenticated = extract_session(&headers)
-        .map(|t| state.sessions.lock().unwrap().contains(&t))
-        .unwrap_or(false);
+    let authenticated = match extract_session(&headers) {
+        Some(t) => match state.sessions.lock() {
+            Ok(guard) => guard.contains(&t),
+            Err(_) => false,
+        },
+        None => false,
+    };
 
     let status_code = if authenticated {
         StatusCode::OK

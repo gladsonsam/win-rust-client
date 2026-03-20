@@ -24,7 +24,7 @@
 use anyhow::{Context, Result};
 use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Key, Mouse, Settings};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 use winrt_notification::Toast;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +104,12 @@ pub struct InputController {
     enigo: Enigo,
 }
 
+// Hard limits to prevent oversized command payloads from causing abusive
+// OS-injection (or excessive CPU/memory use during execution).
+const MAX_TYPE_TEXT_CHARS: usize = 2_000;
+const MAX_NOTIFY_TITLE_CHARS: usize = 64;
+const MAX_NOTIFY_MESSAGE_CHARS: usize = 256;
+
 impl InputController {
     /// Initialise the Enigo input backend.
     ///
@@ -159,7 +165,12 @@ impl InputController {
                 if text.is_empty() {
                     return Ok(());
                 }
-                info!("→ TypeText  len={}", text.chars().count());
+                let chars = text.chars().count();
+                if chars > MAX_TYPE_TEXT_CHARS {
+                    warn!("Ignoring TypeText: too long ({} chars)", chars);
+                    return Ok(());
+                }
+                info!("→ TypeText  len={}", chars);
                 self.enigo.text(&text).context("text failed")?;
             }
 
@@ -179,6 +190,12 @@ impl InputController {
                 let title = title.trim();
                 let message = message.trim();
                 if title.is_empty() && message.is_empty() {
+                    return Ok(());
+                }
+                if title.chars().count() > MAX_NOTIFY_TITLE_CHARS
+                    || message.chars().count() > MAX_NOTIFY_MESSAGE_CHARS
+                {
+                    warn!("Ignoring Notify: title/message too large");
                     return Ok(());
                 }
 

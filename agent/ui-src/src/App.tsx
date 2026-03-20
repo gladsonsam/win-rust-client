@@ -40,7 +40,6 @@ interface AgentConfig {
   agent_name: string;
   agent_password: string;
   ui_password_hash: string;
-  insecure_tls: boolean;
 }
 
 type ConnectionStatus = "Connected" | "Connecting" | "Disconnected" | "Error";
@@ -211,7 +210,6 @@ function SettingsPanel() {
     agent_name: "",
     agent_password: "",
     ui_password_hash: "",
-    insecure_tls: false,
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -329,7 +327,7 @@ function SettingsPanel() {
                 type="text"
                 value={config.server_url}
                 onChange={(e) => setConfig((c) => ({ ...c, server_url: e.target.value }))}
-                placeholder="ws://host:port/ws/agent"
+                placeholder="wss://host:port/ws/agent"
               />
             </FormGroup>
 
@@ -354,16 +352,9 @@ function SettingsPanel() {
               />
             </FormGroup>
             
-            <label className="flex items-center gap-2 mt-4 text-sm text-primary cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={config.insecure_tls}
-                onChange={(e) => setConfig((c) => ({ ...c, insecure_tls: e.target.checked }))}
-                className="w-4 h-4 rounded border-border text-accent focus:ring-accent bg-bg"
-                style={{ width: "1rem", height: "1rem" }}
-              />
-              Ignore TLS certificate errors (for self-signed / local certs)
-            </label>
+            <p className="text-xs text-muted mt-4">
+              TLS is enforced: the agent must connect using <code>wss://</code>.
+            </p>
           </div>
         </section>
 

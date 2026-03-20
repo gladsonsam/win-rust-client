@@ -59,7 +59,6 @@ pub struct SaveConfigPayload {
     pub agent_name: String,
     pub agent_password: String,
     pub ui_password_hash: String,
-    pub insecure_tls: bool,
     /// Present only when the user is changing the UI password.
     pub new_password: Option<String>,
 }
@@ -93,7 +92,6 @@ fn save_config(
         agent_name: config.agent_name.trim().to_string(),
         agent_password: config.agent_password,
         ui_password_hash: ui_hash,
-        insecure_tls: config.insecure_tls,
     };
 
     crate::config::save_config(&new_cfg).map_err(|e| e.to_string())?;

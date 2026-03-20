@@ -43,10 +43,6 @@ pub struct Config {
     /// An empty-string hash (`hash_password("")`) means no password required.
     #[serde(default = "empty_password_hash")]
     pub ui_password_hash: String,
-
-    /// Whether to ignore TLS certificate errors (for self-signed / local certs).
-    #[serde(default)]
-    pub insecure_tls: bool,
 }
 
 fn default_agent_name() -> String {
@@ -64,7 +60,6 @@ impl Default for Config {
             agent_name: default_agent_name(),
             agent_password: String::new(),
             ui_password_hash: empty_password_hash(),
-            insecure_tls: false,
         }
     }
 }
@@ -153,12 +148,6 @@ pub fn load_config() -> Config {
         let v = v.trim();
         if !v.is_empty() {
             cfg.agent_password = v.to_string();
-        }
-    }
-    if let Ok(v) = std::env::var("AGENT_INSECURE_TLS") {
-        let v = v.trim();
-        if !v.is_empty() {
-            cfg.insecure_tls = matches!(v, "1" | "true" | "TRUE");
         }
     }
 

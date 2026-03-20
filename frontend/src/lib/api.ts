@@ -16,7 +16,7 @@ interface PageParams {
 }
 
 async function get<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, { credentials: "include" });
   if (!res.ok) throw new Error(`HTTP ${res.status} – ${url}`);
   return res.json() as Promise<T>;
 }
@@ -26,6 +26,7 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    credentials: "include",
   });
   if (!res.ok) {
     const errBody = (await res.json().catch(() => ({}))) as { error?: string };
@@ -42,7 +43,7 @@ export const api = {
     authenticated: boolean;
     password_required: boolean;
   }> => {
-    const res = await fetch("/api/auth/status");
+    const res = await fetch("/api/auth/status", { credentials: "include" });
     // 401 is a normal "not logged in" response — still parse it.
     if (!res.ok && res.status !== 401) throw new Error(`HTTP ${res.status}`);
     return res.json();
@@ -54,6 +55,7 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password }),
+      credentials: "include",
     });
     if (!res.ok) {
       const body = (await res.json().catch(() => ({}))) as { error?: string };
@@ -63,7 +65,7 @@ export const api = {
 
   /** Clear the current session cookie. */
   logout: async (): Promise<void> => {
-    await fetch("/api/logout", { method: "POST" });
+    await fetch("/api/logout", { method: "POST", credentials: "include" });
   },
 
   // ── Dashboard data ────────────────────────────────────────────────────────
@@ -100,7 +102,10 @@ export const api = {
   // ── Destructive actions ────────────────────────────────────────────────
   /** Clear all stored telemetry history for this agent (windows/keys/urls/activity). */
   clearAgentHistory: async (id: string): Promise<{ cleared_rows: number }> => {
-    const res = await fetch(`/api/agents/${id}/history/clear`, { method: "POST" });
+    const res = await fetch(`/api/agents/${id}/history/clear`, {
+      method: "POST",
+      credentials: "include",
+    });
     if (!res.ok) {
       const body = (await res.json().catch(() => ({}))) as { error?: string };
       throw new Error(body.error ?? `HTTP ${res.status}`);
@@ -169,6 +174,7 @@ export const api = {
   ): Promise<LocalUiPasswordAgentState> => {
     const res = await fetch(`/api/agents/${id}/local-ui-password`, {
       method: "DELETE",
+      credentials: "include",
     });
     if (!res.ok) {
       const errBody = (await res.json().catch(() => ({}))) as { error?: string };

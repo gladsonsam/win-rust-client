@@ -65,10 +65,9 @@ use keylogger::InputEvent;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_tungstenite::{
-    connect_async, connect_async_tls_with_config,
-    tungstenite::client::IntoClientRequest,
+    connect_async,
     tungstenite::{protocol::frame::coding::CloseCode, protocol::CloseFrame, Message},
-    Connector, MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream,
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -188,18 +187,6 @@ fn main() {
             })
             .unwrap_or(false);
 
-    // Allow connecting to WSS endpoints with invalid/untrusted certificates.
-    // This is NOT safe for production, but can help when TLS is misconfigured.
-    let insecure_tls = std::env::args().any(|a| a == "--insecure-tls")
-        || std::env::var("AGENT_INSECURE_TLS")
-            .map(|v| {
-                matches!(
-                    v.trim(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                )
-            })
-            .unwrap_or(false);
-
     // ── Load persisted configuration ──────────────────────────────────────
     let initial_config = config::load_config();
     info!("Config loaded from {:?}", config::config_path());
@@ -257,7 +244,6 @@ fn main() {
                     frame_rx,
                     key_rx,
                     status_bg,
-                    insecure_tls,
                 )
                 .await;
             });
@@ -300,7 +286,6 @@ async fn run_agent_loop(
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
     mut key_rx: mpsc::UnboundedReceiver<InputEvent>,
     status: Arc<Mutex<AgentStatus>>,
-    cli_insecure_tls: bool,
 ) {
     // The capture stop-flag survives reconnects.
     let mut capture_stop: Option<Arc<AtomicBool>> = None;
@@ -328,11 +313,26 @@ async fn run_agent_loop(
             }
             Some(cfg) => {
                 let ws_url = build_ws_url(&cfg);
+                let ws_url_for_log = redact_secret_from_ws_url(&ws_url);
                 set_status(&status, AgentStatus::Connecting);
-                info!("Connecting to {ws_url} …");
+                info!("Connecting to {ws_url_for_log} …");
                 info!("Target FPS (streaming): {TARGET_FPS}");
 
-                match connect_ws(&ws_url, cli_insecure_tls || cfg.insecure_tls).await {
+                // Internet exposure requires TLS; refuse plaintext `ws://` URLs.
+                if !ws_url.starts_with("wss://") {
+                    set_status(
+                        &status,
+                        AgentStatus::Error("Refusing to connect: server URL must be wss:// (HTTPS required)".into()),
+                    );
+                    warn!("Refusing to connect due to non-TLS WebSocket URL: {ws_url}");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)) => {}
+                        _ = config_rx.changed() => { info!("Config changed – applying new settings immediately."); }
+                    }
+                    continue;
+                }
+
+                match connect_ws(&ws_url).await {
                     Ok((ws_stream, response)) => {
                         set_status(&status, AgentStatus::Connected);
                         info!("WebSocket connected (HTTP {}).", response.status().as_u16());
@@ -383,34 +383,10 @@ async fn run_agent_loop(
 
 async fn connect_ws(
     ws_url: &str,
-    insecure_tls: bool,
 ) -> Result<(
     WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     tokio_tungstenite::tungstenite::handshake::client::Response,
 )> {
-    if insecure_tls && ws_url.trim_start().starts_with("wss://") {
-        warn!("TLS verification is DISABLED for this connection (--insecure-tls / AGENT_INSECURE_TLS).");
-        // native-tls: accept invalid certs/hostnames (dangerous; debugging only).
-        let mut builder = native_tls::TlsConnector::builder();
-        builder.danger_accept_invalid_certs(true);
-        builder.danger_accept_invalid_hostnames(true);
-        let tls = builder
-            .build()
-            .context("Failed to build native-tls connector")?;
-
-        let req = ws_url
-            .into_client_request()
-            .context("Invalid WebSocket URL")?;
-        return Ok(connect_async_tls_with_config(
-            req,
-            None,
-            false,
-            Some(Connector::NativeTls(tls)),
-        )
-        .await
-        .context("WebSocket connect failed")?);
-    }
-
     Ok(connect_async(ws_url)
         .await
         .context("WebSocket connect failed")?)
@@ -696,6 +672,28 @@ fn build_ws_url(cfg: &Config) -> String {
     }
 
     url
+}
+
+/// Redact `secret=...` query parameter so agent secrets don't leak via logs,
+/// proxies, or crash reports.
+fn redact_secret_from_ws_url(url: &str) -> String {
+    let Some(secret_start) = url.find("secret=") else {
+        return url.to_string();
+    };
+
+    let mut out = url.to_string();
+    let value_start = secret_start + "secret=".len();
+    if value_start >= out.len() {
+        return out;
+    }
+
+    let value_end = out[value_start..]
+        .find('&')
+        .map(|i| value_start + i)
+        .unwrap_or(out.len());
+
+    out.replace_range(value_start..value_end, "***");
+    out
 }
 
 /// Write to the shared status mutex, ignoring lock-poison errors.

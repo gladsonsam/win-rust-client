@@ -64,9 +64,17 @@ pub struct AppState {
     /// `None` means the dashboard is open with no authentication.
     pub ui_password: Option<String>,
 
+    /// When `ui_password` is unset, allow dashboard access without auth.
+    /// This exists only for local/dev setups; default should be `false`.
+    pub allow_insecure_dashboard_open: bool,
+
     /// Shared secret for authenticating agents connecting to `/ws/agent`.
     /// `None` means agents can connect without authentication (NOT recommended for prod).
     pub agent_secret: Option<String>,
+
+    /// When `agent_secret` is unset, allow agents to connect without auth.
+    /// This exists only for local/dev setups; default should be `false`.
+    pub allow_insecure_agent_auth: bool,
 
     /// Active dashboard session tokens (random UUIDs issued on login).
     /// Stored in memory only — reset when the server restarts.
@@ -85,7 +93,13 @@ pub struct Frame {
 }
 
 impl AppState {
-    pub fn new(db: PgPool, ui_password: Option<String>, agent_secret: Option<String>) -> Self {
+    pub fn new(
+        db: PgPool,
+        ui_password: Option<String>,
+        allow_insecure_dashboard_open: bool,
+        agent_secret: Option<String>,
+        allow_insecure_agent_auth: bool,
+    ) -> Self {
         let (tx, _) = broadcast::channel(4096);
         Self {
             db,
@@ -95,7 +109,9 @@ impl AppState {
             agent_cmds: Mutex::new(HashMap::new()),
             capture_viewers: Mutex::new(HashMap::new()),
             ui_password,
+            allow_insecure_dashboard_open,
             agent_secret,
+            allow_insecure_agent_auth,
             sessions: Mutex::new(HashSet::new()),
         }
     }

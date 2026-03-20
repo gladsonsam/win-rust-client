@@ -7,12 +7,12 @@
 //! | `DATABASE_URL` | `postgres://monitor:monitor@localhost:5432/monitor` |
 //! | `LISTEN_ADDR`  | `0.0.0.0:9000`                                      |
 //! | `STATIC_DIR`   | `./static`                                          |
-//! | `UI_PASSWORD`  | *(unset – open access)*                             |
+//! | `UI_PASSWORD`  | *(unset – deny access; set ALLOW_INSECURE_DASHBOARD_OPEN=true to allow)* |
 //! | `RUST_LOG`     | `info`                                              |
 //!
 //! Set `UI_PASSWORD` to enable password protection for the dashboard.
-//! The agent WebSocket (`/ws/agent`) is always unauthenticated so agents
-//! can connect without browser cookies.
+//! The agent WebSocket (`/ws/agent`) uses a shared secret (`AGENT_SECRET`)
+//! for auth (agents can still connect without browser cookies).
 
 mod api;
 mod auth;
@@ -24,11 +24,17 @@ mod ws_viewer;
 use std::sync::Arc;
 
 use axum::{
+    extract::Request,
+    extract::State,
     http::StatusCode,
     middleware::from_fn_with_state,
     routing::{get, post},
     Router,
 };
+use axum::http::header::HeaderValue;
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::response::IntoResponse;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -79,22 +85,42 @@ async fn main() -> anyhow::Result<()> {
 
     // ── UI password ───────────────────────────────────────────────────────
     let ui_password = read_env_or_file("UI_PASSWORD").filter(|s| !s.is_empty());
+    let allow_insecure_dashboard_open = read_env_or_file("ALLOW_INSECURE_DASHBOARD_OPEN")
+        .map(|v| parse_bool(&v))
+        .unwrap_or(false);
 
     if ui_password.is_some() {
         info!("Dashboard password protection enabled.");
     } else {
-        info!("Dashboard password protection disabled (set UI_PASSWORD to enable).");
+        if allow_insecure_dashboard_open {
+            info!("Dashboard password protection disabled (insecure opt-in).");
+        } else {
+            info!("Dashboard password protection disabled (deny access; set UI_PASSWORD).");
+        }
     }
 
     // ── App state ─────────────────────────────────────────────────────────
     let agent_secret = read_env_or_file("AGENT_SECRET").filter(|s| !s.is_empty());
+    let allow_insecure_agent_auth = read_env_or_file("ALLOW_INSECURE_AGENT_AUTH")
+        .map(|v| parse_bool(&v))
+        .unwrap_or(false);
     if agent_secret.is_some() {
         info!("Agent authentication enabled (AGENT_SECRET set).");
     } else {
-        info!("Agent authentication disabled (set AGENT_SECRET to enable).");
+        if allow_insecure_agent_auth {
+            info!("Agent authentication disabled (insecure opt-in).");
+        } else {
+            info!("Agent authentication disabled (deny agent connections; set AGENT_SECRET).");
+        }
     }
 
-    let state = Arc::new(state::AppState::new(pool, ui_password, agent_secret));
+    let state = Arc::new(state::AppState::new(
+        pool,
+        ui_password,
+        allow_insecure_dashboard_open,
+        agent_secret,
+        allow_insecure_agent_auth,
+    ));
 
     // ── Routes ────────────────────────────────────────────────────────────
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./static".into());
@@ -127,6 +153,12 @@ async fn main() -> anyhow::Result<()> {
         // - set CORS_ORIGINS="https://dashboard.example.com,https://other.example.com"
         //   to restrict in production.
         .layer(cors_layer_from_env())
+        .layer(from_fn_with_state(
+            // Enforce HTTPS via X-Forwarded-Proto. This works when you
+            // terminate TLS at a reverse proxy (Traefik, Nginx, etc.).
+            https_enforced(),
+            require_https,
+        ))
         .with_state(state);
 
     // ── Listen ────────────────────────────────────────────────────────────
@@ -139,11 +171,74 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn https_enforced() -> bool {
+    // Default off to avoid breaking existing local setups that don't have
+    // X-Forwarded-Proto (plain `http://:9000`).
+    std::env::var("ENFORCE_HTTPS")
+        .ok()
+        .map(|v| parse_bool(&v))
+        .unwrap_or(true)
+}
+
+async fn require_https(
+    State(enforce): State<bool>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !enforce {
+        return next.run(req).await;
+    }
+
+    // Allow health checks without HTTPS enforcement.
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+
+    let forwarded_proto = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // Some reverse proxies set X-Forwarded-Proto to `wss` for WebSocket
+    // upgrades. Treat it as valid because it still means TLS.
+    if forwarded_proto.eq_ignore_ascii_case("https")
+        || forwarded_proto.eq_ignore_ascii_case("wss")
+    {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UPGRADE_REQUIRED,
+            "HTTPS required (set ENFORCE_HTTPS=false for local HTTP testing).",
+        )
+            .into_response()
+    }
+}
+
 fn cors_layer_from_env() -> CorsLayer {
-    // The dashboard is served by the same origin as the API (same container),
-    // so CORS is not a real concern here. CorsLayer::permissive() is fine and
-    // avoids the incompatibility between `allow_credentials` and wildcard methods.
-    CorsLayer::permissive()
+    let raw = std::env::var("CORS_ORIGINS").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        // Dev/default behavior: don't actively constrain CORS.
+        return CorsLayer::permissive();
+    }
+
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<HeaderValue>().ok())
+        .collect();
+
+    if origins.is_empty() {
+        return CorsLayer::permissive();
+    }
+
+    // Since the dashboard uses cookie auth, we must allow credentials when
+    // cross-origin requests are expected.
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_credentials(true)
 }
 
 /// Read config either from `NAME` or `NAME_FILE` (Docker secrets pattern).
@@ -156,4 +251,11 @@ fn read_env_or_file(name: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+fn parse_bool(s: &str) -> bool {
+    matches!(
+        s.trim(),
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+    )
 }
